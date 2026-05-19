@@ -1,0 +1,43 @@
+{
+  "name": "mojigames-common",
+  "version": "0.1.0",
+  "description": "Shared infrastructure for Mojigames emoji-themed games: multiplayer networking and persistent storage.",
+  "license": "UNLICENSED",
+  "private": true,
+  "exports": {
+    "./multiplayer": "./src/multiplayer/index.ts",
+    "./nearby": "./src/nearby/index.ts",
+    "./storage": "./src/storage/index.ts"
+  },
+  "scripts": {
+    "test": "jest",
+    "typecheck": "tsc"
+  },
+  "peerDependencies": {
+    "@react-native-async-storage/async-storage": "*",
+    "expo-nearby-connections": "*",
+    "react": "*",
+    "react-native": "*"
+  },
+  "peerDependenciesMeta": {
+    "expo-nearby-connections": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@types/jest": "29.5.14",
+    "@types/react": "~19.2.2",
+    "expo": "~55.0.24",
+    "expo-nearby-connections": "^1.1.0",
+    "jest": "~29.7.0",
+    "jest-expo": "~55.0.17",
+    "react": "19.2.0",
+    "react-native": "0.83.6",
+    "react-native-nitro-modules": "^0.35.6",
+    "typescript": "~5.9.2"
+  },
+  "jest": {
+    "preset": "jest-expo"
+  }
+}

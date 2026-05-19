@@ -1,0 +1,17 @@
+{
+  "name": "mojigames-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket relay server for Mojigames online multiplayer.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "smoke-test": "node smoke-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.20.1"
+  }
+}
