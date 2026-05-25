@@ -7,7 +7,7 @@ Emoji Encore so every game starts with the same plumbing instead of rebuilding i
 
 | Import | What it gives you |
 |---|---|
-| `mojigames-common/multiplayer` | The `Transport` abstraction, `OnlineTransport` (a WebSocket relay client), and the `useMultiplayer` React hook. |
+| `mojigames-common/multiplayer` | The `Transport` abstraction, `OnlineTransport` (a WebSocket relay client), the `useMultiplayer` React hook (1v1), and `useParty` (N-player, size-capped rooms: roster + host-authoritative start + live progress). |
 | `mojigames-common/nearby` | `NearbyTransport` — in-person play between two phones in the same room (Bluetooth / local Wi-Fi), no internet. It's a `Transport`, so it drops straight into `useMultiplayer`. |
 | `mojigames-common/storage` | `createStorage()` — a namespaced key/value store with a versioned wipe, over AsyncStorage. |
 | `relay-server/` | A small, game-agnostic WebSocket relay server. Deploy it once; every game's online play can share it. |
@@ -27,7 +27,7 @@ Everything here is **game-agnostic** — no game's catalog, scoring, or screens.
 Run `npm install`, then import from the entry points:
 
 ```ts
-import { useMultiplayer, OnlineTransport } from 'mojigames-common/multiplayer';
+import { useMultiplayer, useParty, OnlineTransport } from 'mojigames-common/multiplayer';
 import { NearbyTransport } from 'mojigames-common/nearby';
 import { createStorage } from 'mojigames-common/storage';
 ```
