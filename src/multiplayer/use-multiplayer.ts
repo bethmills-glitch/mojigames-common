@@ -37,8 +37,14 @@ export interface Multiplayer {
   opponentId: string | null;
   /** A short reason when `status === 'error'` (e.g. `no-room`, `room-full`, `opponent-left`). */
   error: string | null;
-  /** Create a room — `status` goes connecting → waiting → connected. */
-  host: () => void;
+  /**
+   * Create a room — `status` goes connecting → waiting → connected.
+   *
+   * `size` caps the total number of players (host + guests). Defaults to 2 (the
+   * original 2-player Versus shape). Party-mode lobbies pass higher values (up to 8).
+   * Each transport decides what to do with the cap; `NearbyTransport` honors it.
+   */
+  host: (options?: { size?: number }) => void;
   /** Join a room by code — `status` goes connecting → connected (or error). */
   join: (code: string) => void;
   /** Send a message to the opponent. A no-op before the room is connected. */
@@ -129,11 +135,14 @@ export function useMultiplayer({
     return transportRef.current;
   }, [handleEvent]);
 
-  const host = useCallback(() => {
-    setError(null);
-    setStatus('connecting');
-    ensureTransport().host({ size: 2 });
-  }, [ensureTransport]);
+  const host = useCallback(
+    (options?: { size?: number }) => {
+      setError(null);
+      setStatus('connecting');
+      ensureTransport().host({ size: options?.size ?? 2 });
+    },
+    [ensureTransport],
+  );
 
   const join = useCallback(
     (joinCode: string) => {

@@ -1,7 +1,7 @@
-// NearbyTransport — the `nearby` transport: in-person play between two phones in the same
-// room, with no internet and no relay server. It implements the same `Transport` interface
-// as `OnlineTransport` (mojigames-common/multiplayer), so `useMultiplayer` drives either
-// one identically.
+// NearbyTransport — the `nearby` transport: in-person play between 2-8 phones in the
+// same room, with no internet and no relay server. It implements the same `Transport`
+// interface as `OnlineTransport` (mojigames-common/multiplayer), so `useMultiplayer`
+// drives either one identically.
 //
 // It is built on `expo-nearby-connections`, which wraps Apple MultipeerConnectivity (iOS)
 // and Google Nearby Connections (Android). That library is a native module, so:
@@ -9,14 +9,22 @@
 //   • in Expo Go the native module is absent and `loadNearbyLib()` returns null;
 //   • on web there is no nearby radio at all (nearby-lib.web.ts stubs the loader).
 // In the latter two cases `host()`/`join()` emit `error: nearby-unavailable` and the game
-// is unaffected — the Versus screen simply offers online play only.
+// is unaffected.
 //
 // ── Mapping the discovery model onto host/join-by-code ──
 // `expo-nearby-connections` is discovery-based (advertise / scan / connect), not
-// code-based. To fit the `Transport` interface — and to keep the Versus lobby UI identical
-// to online play — the host mints a short share code and *advertises under that code as
-// its name*; the guest scans, and connects to the one advertiser whose name matches the
+// code-based. To fit the `Transport` interface — and to keep the lobby UI identical to
+// online play — the host mints a short share code and *advertises under that code as its
+// name*; each guest scans, and connects to the one advertiser whose name matches the
 // code the player typed. The code also disambiguates two games running in the same room.
+//
+// ── Topology: star with host-relay ──
+// expo-nearby-connections uses STRATEGY_P2P_STAR — every guest connects to the host, but
+// guests are NOT connected to each other. To make `Transport.send()` behave like a
+// broadcast network (its documented contract: "send to every other peer"), the host
+// transparently relays every text frame it receives from a guest to all OTHER connected
+// guests. From the app's perspective each peer's `send()` reaches every other peer; the
+// star is invisible above this layer.
 
 import type { Transport, TransportEvent, TransportListener } from '../multiplayer';
 
@@ -75,8 +83,7 @@ export function makeNearbyCode(): string {
 
 /**
  * Whether in-person nearby play can run here: true only on a native build with the
- * `expo-nearby-connections` module present. False on web and in Expo Go. The Versus
- * screen calls this to decide whether to offer the "Same Room" option at all.
+ * `expo-nearby-connections` module present. False on web and in Expo Go.
  */
 export function isNearbyAvailable(): boolean {
   return loadNearbyLib() !== null;
@@ -84,17 +91,20 @@ export function isNearbyAvailable(): boolean {
 
 // ── Tuning ───────────────────────────────────────────────────────────────────────────────
 
-/** expo-nearby-connections `Strategy.P2P_STAR` — the documented default; fits the one-host
- *  + one-guest shape of a Versus match. Both peers MUST use the same strategy to find each
- *  other. (The enum value is inlined so the native module is not imported just for it.) */
+/** expo-nearby-connections `Strategy.P2P_STAR` — every guest connects to the host; guests
+ *  are not connected to each other. The host's text-frame relay (see `handleText`) makes
+ *  `send()` behave like a broadcast network at the Transport-interface level. */
 const STRATEGY_P2P_STAR = 2;
 
-/** The discovery name a guest scans under. The host never uses it (the player's real name
- *  is exchanged later in the Versus `hello` handshake), so a constant is fine. */
+/** The discovery name a guest scans under. The host never uses it (the real player name
+ *  is exchanged at the protocol layer), so a constant is fine. */
 const DISCOVERY_NAME = 'Emoji Encore';
 
 /** How long a guest scans for the host's code before giving up with `no-room`. */
 const DEFAULT_CONNECT_TIMEOUT_MS = 25_000;
+
+/** Default room size — host + 1 guest. Matches 2-player Versus (the original use). */
+const DEFAULT_ROOM_SIZE = 2;
 
 // ── Options ──────────────────────────────────────────────────────────────────────────────
 
@@ -123,10 +133,15 @@ export class NearbyTransport implements Transport {
   private code: string | null = null;
   /** This device's peer id (from `startAdvertise` / `startDiscovery`). */
   private selfId: string | null = null;
-  /** The connected opponent's peer id, once `onConnected` has fired. */
-  private opponentId: string | null = null;
-  /** The peer a connection is in flight to/from — guards the request→connected gap. */
-  private pendingPeerId: string | null = null;
+  /**
+   * Every peer this device is connected to. On the host this is all guests; on a guest
+   * it is just the host (single entry).
+   */
+  private readonly connectedPeers = new Set<string>();
+  /** Peer connections in flight — guards the request→connected gap. */
+  private readonly pendingPeers = new Set<string>();
+  /** Total room size (host + guests). Set by `host({size})`; default 2. */
+  private maxRoomSize = DEFAULT_ROOM_SIZE;
   /** The guest's scan timeout. */
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Set once `host()`/`join()` has run — each transport hosts or joins exactly once. */
@@ -145,9 +160,12 @@ export class NearbyTransport implements Transport {
     };
   }
 
-  host(_options?: { size?: number }): void {
-    // Versus is always two players, so `size` is ignored — there is one host and one guest.
+  host(options?: { size?: number }): void {
     if (!this.begin('host')) return;
+    // size = total players in the room (host + guests). Clamp to at least 2 — a single-
+    // player "room" makes no sense for any transport. No hard upper bound here; the app
+    // caps via the size option it passes (party mode uses 8).
+    this.maxRoomSize = Math.max(DEFAULT_ROOM_SIZE, options?.size ?? DEFAULT_ROOM_SIZE);
     this.code = makeNearbyCode();
     void this.runStart(async (nearby) => {
       const selfId = await nearby.startAdvertise(this.code as string, STRATEGY_P2P_STAR);
@@ -169,11 +187,14 @@ export class NearbyTransport implements Transport {
   }
 
   send(data: unknown): void {
-    if (this.closed || !this.opponentId || !this.nearby) return;
+    if (this.closed || !this.nearby || this.connectedPeers.size === 0) return;
     // Nearby has no relay protocol layer — the JSON payload travels as the text frame.
-    void this.nearby.sendText(this.opponentId, JSON.stringify(data)).catch(() => {
-      /* a dropped frame surfaces as the opponent stalling, not as a thrown error */
-    });
+    const text = JSON.stringify(data);
+    for (const peerId of this.connectedPeers) {
+      void this.nearby.sendText(peerId, text).catch(() => {
+        /* a dropped frame surfaces as the peer stalling, not as a thrown error */
+      });
+    }
   }
 
   close(): void {
@@ -259,26 +280,30 @@ export class NearbyTransport implements Transport {
   /** Guest: a nearby advertiser was discovered — connect if its name is the room code. */
   private handlePeerFound(peer: NearbyPeer): void {
     if (this.role !== 'guest' || this.closed) return;
-    if (this.opponentId || this.pendingPeerId) return; // already connecting / connected
+    // The guest only ever connects to ONE host. Once we have a connection or one is in
+    // flight, ignore any further peers found (they may be other hosts on different codes).
+    if (this.connectedPeers.size > 0 || this.pendingPeers.size > 0) return;
     if (peer.name.toUpperCase().trim() !== this.code) return; // a different room
-    this.pendingPeerId = peer.peerId;
+    this.pendingPeers.add(peer.peerId);
     void (this.nearby as NearbyApi).requestConnection(peer.peerId).catch(() => {
-      this.pendingPeerId = null;
+      this.pendingPeers.delete(peer.peerId);
       if (!this.closed) this.emit({ type: 'error', reason: 'connect-failed' });
     });
   }
 
-  /** Host: a guest asked to connect — accept the first, decline the rest (Versus is 1v1). */
+  /** Host: a guest asked to connect — accept if the room has room, else reject. */
   private handleInvitation(peer: NearbyPeer): void {
     if (this.role !== 'host' || this.closed) return;
     const nearby = this.nearby as NearbyApi;
-    if (this.opponentId || this.pendingPeerId) {
+    // The host accepts up to (maxRoomSize - 1) guests — host counts as 1 of N.
+    const totalConnections = this.connectedPeers.size + this.pendingPeers.size;
+    if (totalConnections >= this.maxRoomSize - 1) {
       void nearby.rejectConnection(peer.peerId).catch(() => {});
       return;
     }
-    this.pendingPeerId = peer.peerId;
+    this.pendingPeers.add(peer.peerId);
     void nearby.acceptConnection(peer.peerId).catch(() => {
-      this.pendingPeerId = null;
+      this.pendingPeers.delete(peer.peerId);
       if (!this.closed) this.emit({ type: 'error', reason: 'connect-failed' });
     });
   }
@@ -286,21 +311,24 @@ export class NearbyTransport implements Transport {
   /** Either role: a peer connection was established. */
   private handleConnected(peer: NearbyPeer): void {
     if (this.closed) return;
-    if (this.opponentId) {
-      // A surplus connection — Versus is 1v1, so drop anyone who is not our opponent.
-      if (peer.peerId !== this.opponentId) {
-        void (this.nearby as NearbyApi).disconnect(peer.peerId).catch(() => {});
-      }
+    if (this.connectedPeers.has(peer.peerId)) return;
+    // Defensive: if a connection arrived past the cap (e.g. an acceptance and a rejection
+    // crossed in flight), drop it cleanly.
+    if (this.role === 'host' && this.connectedPeers.size >= this.maxRoomSize - 1) {
+      void (this.nearby as NearbyApi).disconnect(peer.peerId).catch(() => {});
       return;
     }
-    this.opponentId = peer.peerId;
-    this.pendingPeerId = null;
+    this.connectedPeers.add(peer.peerId);
+    this.pendingPeers.delete(peer.peerId);
     this.clearConnectTimeout();
     if (this.role === 'host') {
-      // The room is full — stop advertising so no one else discovers it.
-      void (this.nearby as NearbyApi).stopAdvertise().catch(() => {});
+      // Stop advertising once the room is full — no one else can discover us.
+      if (this.connectedPeers.size >= this.maxRoomSize - 1) {
+        void (this.nearby as NearbyApi).stopAdvertise().catch(() => {});
+      }
       this.emit({ type: 'peer-join', peerId: peer.peerId });
     } else {
+      // Guest: we connected to the host. Stop scanning and emit `joined` exactly once.
       void (this.nearby as NearbyApi).stopDiscovery().catch(() => {});
       this.emit({
         type: 'joined',
@@ -311,16 +339,35 @@ export class NearbyTransport implements Transport {
     }
   }
 
-  /** Either role: a peer disconnected — report it only for our actual opponent. */
+  /** Either role: a peer disconnected. */
   private handleDisconnected(peerId: string): void {
-    if (this.closed || peerId !== this.opponentId) return;
-    this.opponentId = null;
+    if (this.closed) return;
+    if (!this.connectedPeers.has(peerId)) return;
+    this.connectedPeers.delete(peerId);
     this.emit({ type: 'peer-leave', peerId });
+    // Host: a guest left and the room now has room again — restart advertising so a
+    // replacement can join. (If the host hadn't yet stopped advertising — i.e. the room
+    // was never full — this is a harmless duplicate start that the native module ignores.)
+    if (
+      this.role === 'host' &&
+      this.code &&
+      this.connectedPeers.size < this.maxRoomSize - 1
+    ) {
+      void (this.nearby as NearbyApi)
+        .startAdvertise(this.code, STRATEGY_P2P_STAR)
+        .catch(() => {});
+    }
   }
 
-  /** Either role: a text frame arrived from a peer — unwrap the JSON game payload. */
+  /**
+   * Either role: a text frame arrived from a peer.
+   *
+   * The host additionally relays the frame to all OTHER connected peers — implementing
+   * the star-topology host-relay that makes `Transport.send()`'s "broadcast to every
+   * other peer" contract hold for guests too.
+   */
   private handleText(peerId: string, text: string): void {
-    if (this.closed || peerId !== this.opponentId) return;
+    if (this.closed || !this.connectedPeers.has(peerId)) return;
     let data: unknown;
     try {
       data = JSON.parse(text);
@@ -328,6 +375,14 @@ export class NearbyTransport implements Transport {
       return; // ignore anything that is not JSON
     }
     this.emit({ type: 'message', from: peerId, data });
+    // Host-relay: forward the frame to every connected peer other than the sender. This
+    // gives the same end-to-end behaviour as a true mesh, with one extra hop's latency.
+    if (this.role === 'host' && this.nearby) {
+      for (const otherPeerId of this.connectedPeers) {
+        if (otherPeerId === peerId) continue;
+        void this.nearby.sendText(otherPeerId, text).catch(() => {});
+      }
+    }
   }
 
   /** Guest: give up if no advertiser with the typed code is reached in time. */
@@ -335,7 +390,7 @@ export class NearbyTransport implements Transport {
     this.clearConnectTimeout();
     this.connectTimer = setTimeout(() => {
       this.connectTimer = null;
-      if (this.closed || this.opponentId) return;
+      if (this.closed || this.connectedPeers.size > 0) return;
       // No advertiser with this code connected — a wrong code, or the host is not hosting.
       this.emit({ type: 'error', reason: 'no-room' });
       void this.nearby?.stopDiscovery().catch(() => {});

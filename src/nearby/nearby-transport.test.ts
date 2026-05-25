@@ -340,3 +340,146 @@ describe('NearbyTransport — unavailable & close', () => {
     expect(events).toHaveLength(countAfterClose);
   });
 });
+
+// ── N-player party (size > 2) ────────────────────────────────────────────────────────────
+
+describe('NearbyTransport — N-player party', () => {
+  it('accepts (size - 1) guests when host({ size: N }) is called', async () => {
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api });
+    const events = collect(transport);
+
+    transport.host({ size: 4 }); // host + 3 guests
+    await flush();
+
+    // First three guests are accepted and produce peer-join events.
+    for (const id of ['g1', 'g2', 'g3']) {
+      fake.fire.invitationReceived({ peerId: id, name: 'P' });
+      fake.fire.connected({ peerId: id, name: 'P' });
+    }
+    expect(eventsOfType(events, 'peer-join')).toHaveLength(3);
+
+    // Every accept call landed on the right guest, in order.
+    const accepts = fake.calls
+      .filter((c) => c.method === 'acceptConnection')
+      .map((c) => c.args[0]);
+    expect(accepts).toEqual(['g1', 'g2', 'g3']);
+
+    // The room is now full — stopAdvertise was called once we hit (size - 1) guests.
+    expect(methodNames(fake)).toContain('stopAdvertise');
+  });
+
+  it('rejects guests beyond the room size', async () => {
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api });
+    const events = collect(transport);
+
+    transport.host({ size: 3 }); // host + 2 guests
+    await flush();
+
+    fake.fire.invitationReceived({ peerId: 'g1', name: 'P' });
+    fake.fire.connected({ peerId: 'g1', name: 'P' });
+    fake.fire.invitationReceived({ peerId: 'g2', name: 'P' });
+    fake.fire.connected({ peerId: 'g2', name: 'P' });
+
+    // Room is now full — the third guest is rejected, no peer-join.
+    fake.fire.invitationReceived({ peerId: 'g3', name: 'P' });
+    const rejects = fake.calls
+      .filter((c) => c.method === 'rejectConnection')
+      .map((c) => c.args[0]);
+    expect(rejects).toEqual(['g3']);
+    expect(eventsOfType(events, 'peer-join')).toHaveLength(2);
+  });
+
+  it('broadcasts send() to every connected guest', async () => {
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api });
+
+    transport.host({ size: 4 });
+    await flush();
+    for (const id of ['g1', 'g2', 'g3']) {
+      fake.fire.invitationReceived({ peerId: id, name: 'P' });
+      fake.fire.connected({ peerId: id, name: 'P' });
+    }
+
+    transport.send({ kind: 'party:roster', players: [] });
+
+    const recipients = fake.calls
+      .filter((c) => c.method === 'sendText')
+      .map((c) => c.args[0]);
+    // Order is set-iteration order — assert membership, not sequence.
+    expect(recipients).toHaveLength(3);
+    expect(new Set(recipients)).toEqual(new Set(['g1', 'g2', 'g3']));
+  });
+
+  it('relays a guest text frame to every OTHER guest (host star-relay)', async () => {
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api });
+    const events = collect(transport);
+
+    transport.host({ size: 4 });
+    await flush();
+    for (const id of ['g1', 'g2', 'g3']) {
+      fake.fire.invitationReceived({ peerId: id, name: 'P' });
+      fake.fire.connected({ peerId: id, name: 'P' });
+    }
+
+    // g1 sends a frame; the host should emit `message` locally AND relay it to g2 & g3.
+    const frame = '{"kind":"party:progress","id":"g1","score":42,"roundsDone":1,"done":false}';
+    fake.fire.textReceived({ peerId: 'g1', text: frame });
+
+    const messages = eventsOfType(events, 'message');
+    expect(messages).toHaveLength(1);
+    expect(messages[0].from).toBe('g1');
+
+    // Relay went out to the OTHER guests, not back to the sender.
+    const relays = fake.calls
+      .filter((c) => c.method === 'sendText')
+      .map((c) => c.args[0]);
+    expect(relays).toHaveLength(2);
+    expect(new Set(relays)).toEqual(new Set(['g2', 'g3']));
+  });
+
+  it('restarts advertising when a guest leaves and a slot opens up', async () => {
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api });
+
+    transport.host({ size: 3 });
+    await flush();
+    fake.fire.invitationReceived({ peerId: 'g1', name: 'P' });
+    fake.fire.connected({ peerId: 'g1', name: 'P' });
+    fake.fire.invitationReceived({ peerId: 'g2', name: 'P' });
+    fake.fire.connected({ peerId: 'g2', name: 'P' });
+
+    // Room is full — exactly one stopAdvertise so far.
+    const stopsBefore = methodNames(fake).filter((m) => m === 'stopAdvertise').length;
+    expect(stopsBefore).toBe(1);
+
+    // A guest leaves — the room has room again, so advertising restarts.
+    fake.fire.disconnected({ peerId: 'g1' });
+    const restarts = methodNames(fake).filter((m) => m === 'startAdvertise').length;
+    // Initial startAdvertise + the restart after the disconnect.
+    expect(restarts).toBe(2);
+  });
+
+  it('guest still only connects to one host even after multiple peers are found', async () => {
+    // The N-player extension is host-only — the guest's behaviour is unchanged: it
+    // connects to the first matching advertiser and ignores the rest.
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api });
+    const events = collect(transport);
+
+    transport.join('ABCD');
+    await flush();
+    fake.fire.peerFound({ peerId: 'host-a', name: 'ABCD' });
+    fake.fire.connected({ peerId: 'host-a', name: 'ABCD' });
+
+    // A second host shows up after we've already connected — should be ignored.
+    fake.fire.peerFound({ peerId: 'host-b', name: 'ABCD' });
+    const requestArgs = fake.calls
+      .filter((c) => c.method === 'requestConnection')
+      .map((c) => c.args[0]);
+    expect(requestArgs).toEqual(['host-a']);
+    expect(eventsOfType(events, 'joined')).toHaveLength(1);
+  });
+});
