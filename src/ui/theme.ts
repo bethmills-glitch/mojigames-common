@@ -10,20 +10,20 @@ export type Gradient = readonly [string, string, ...string[]];
 
 /** Per-category button gradients (purple / cyan / gold / rose). `gold`/`silver` are kept for
  *  back-compat with the original web-app treatments. */
-export const CategoryGradients: Record<string, Gradient> = {
-  songs: ['#A65CFF', '#8B3FE8', '#6E27C2'], // logo purple
-  movies: ['#4FC8F5', '#2AAAE0', '#1585C8'], // sky-blue cyan
-  tv: ['#FFD24D', '#FFB81E', '#E0A000'], // golden yellow
-  musicals: ['#F488C0', '#E0559A', '#B82E78'], // rose
-  gold: ['#E1CFA6', '#C2A263', '#8E7846'],
-  silver: ['#E4E6EB', '#AEB2BC', '#7E838E'],
+export const CategoryGradients = {
+  songs: ['#A65CFF', '#8B3FE8', '#6E27C2'] as const, // logo purple
+  movies: ['#4FC8F5', '#2AAAE0', '#1585C8'] as const, // sky-blue cyan
+  tv: ['#FFD24D', '#FFB81E', '#E0A000'] as const, // golden yellow
+  musicals: ['#F488C0', '#E0559A', '#B82E78'] as const, // rose
+  gold: ['#E1CFA6', '#C2A263', '#8E7846'] as const,
+  silver: ['#E4E6EB', '#AEB2BC', '#7E838E'] as const,
 };
 
 /** Special-mode button gradients, in the logo's bright accent colours. */
-export const ModeGradients: Record<string, Gradient> = {
-  battle: ['#FF6A4E', '#E83026', '#C01A14'], // fiery red
-  party: ['#3CD8C6', '#18C0AE', '#0E9688'], // turquoise
-};
+export const ModeGradients = {
+  battle: ['#FF6A4E', '#E83026', '#C01A14'] as const, // fiery red
+  party: ['#3CD8C6', '#18C0AE', '#0E9688'] as const, // turquoise
+} as const;
 
 /** Border-radius scale. */
 export const Radius = { sm: 7, md: 10, lg: 12, xl: 16, xxl: 20 } as const;
