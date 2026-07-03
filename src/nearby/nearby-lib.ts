@@ -55,15 +55,18 @@ export async function ensureNearbyPermissions(): Promise<boolean> {
   if (Platform.OS !== 'android') return true;
   const api = typeof Platform.Version === 'number' ? Platform.Version : 0;
   const P = PermissionsAndroid.PERMISSIONS;
-  // Location is requested on every level (older Android gates BLE scanning on it, and
-  // Nearby Connections still asks for it); the granular Bluetooth permissions are
-  // Android 12+ (API 31) and Wi-Fi-based discovery is Android 13+ (API 33).
-  const wanted: AndroidPermission[] = [P.ACCESS_FINE_LOCATION];
+  // Android 12+ (API 31): the granular Bluetooth permissions — and NO location. The consuming
+  // apps' manifests declare BLUETOOTH_SCAN with usesPermissionFlags="neverForLocation" (we never
+  // derive location from scans), which is what lets Nearby Connections run location-free on
+  // modern Android. These are kids' apps: a location prompt they don't need is a Families-review
+  // red flag and a scary parent moment. Wi-Fi-based discovery adds NEARBY_WIFI_DEVICES on 13+.
+  // Android 11 and older gate BLE scanning behind (fine) location — unavoidable there.
+  const wanted: AndroidPermission[] = [];
   if (api >= 31) {
     wanted.push(P.BLUETOOTH_ADVERTISE, P.BLUETOOTH_CONNECT, P.BLUETOOTH_SCAN);
-  }
-  if (api >= 33) {
-    wanted.push(P.NEARBY_WIFI_DEVICES);
+    if (api >= 33) wanted.push(P.NEARBY_WIFI_DEVICES);
+  } else {
+    wanted.push(P.ACCESS_FINE_LOCATION);
   }
   try {
     const result = await PermissionsAndroid.requestMultiple(wanted);
