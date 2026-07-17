@@ -28,10 +28,16 @@ export interface OnlineTransportOptions {
   url: string;
   /** WebSocket implementation. Defaults to the global one (present in RN and browsers). */
   WebSocketImpl?: WebSocketCtor;
+  /** Override the host/join response timeout — exposed for tests. */
+  connectTimeoutMs?: number;
 }
 
 /** The OPEN ready-state value — identical (`1`) across every WebSocket implementation. */
 const WS_OPEN = 1;
+
+/** How long to wait for the relay to answer a host/join request before giving up. Matches
+ *  NearbyTransport's DEFAULT_CONNECT_TIMEOUT_MS so both transports fail at the same pace. */
+const DEFAULT_CONNECT_TIMEOUT_MS = 25_000;
 
 /** A parsed inbound relay message — only the fields this transport reads, all optional. */
 interface RelayMessage {
@@ -47,6 +53,7 @@ interface RelayMessage {
 export class OnlineTransport implements Transport {
   private readonly url: string;
   private readonly WebSocketImpl: WebSocketCtor;
+  private readonly connectTimeoutMs: number;
   private ws: WebSocketLike | null = null;
   private readonly listeners = new Set<TransportListener>();
   /** The host/join request to send once the socket opens (it is issued before connect). */
@@ -56,6 +63,8 @@ export class OnlineTransport implements Transport {
     | null = null;
   /** True once `close()` was called here — tells a clean shutdown from a dropped link. */
   private closedByUs = false;
+  /** Fires if the relay never answers a host/join request — see startConnectTimeout(). */
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: OnlineTransportOptions) {
     this.url = options.url;
@@ -66,6 +75,7 @@ export class OnlineTransport implements Transport {
       throw new Error('OnlineTransport: no WebSocket implementation available');
     }
     this.WebSocketImpl = Impl;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   }
 
   subscribe(listener: TransportListener): () => void {
@@ -77,11 +87,13 @@ export class OnlineTransport implements Transport {
 
   host(options?: { size?: number }): void {
     this.pendingIntent = { kind: 'host', size: Math.max(2, options?.size ?? 2) };
+    this.startConnectTimeout();
     this.beginOrResend();
   }
 
   join(code: string): void {
     this.pendingIntent = { kind: 'join', code: code.toUpperCase().trim() };
+    this.startConnectTimeout();
     this.beginOrResend();
   }
 
@@ -90,6 +102,7 @@ export class OnlineTransport implements Transport {
   }
 
   close(): void {
+    this.clearConnectTimeout();
     this.closedByUs = true;
     if (this.ws) {
       try {
@@ -107,6 +120,38 @@ export class OnlineTransport implements Transport {
   private emit(event: TransportEvent): void {
     // Iterate a copy so a listener that unsubscribes mid-dispatch is safe.
     for (const listener of [...this.listeners]) listener(event);
+  }
+
+  /** Give up if the relay never answers a host/join request (socket up or not). Mirrors
+   *  NearbyTransport's guest-side scan timeout, but covers both roles: unlike a missing
+   *  advertiser (which the OS-level discovery API itself can time out), a relay that opens
+   *  the socket but never replies to `host`/`join` has nothing else to time it out here. */
+  private startConnectTimeout(): void {
+    this.clearConnectTimeout();
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      this.emit({ type: 'error', reason: 'timeout' });
+      // Drop the stalled socket so a fresh host()/join() call reconnects cleanly. Mark it
+      // closedByUs first — connect()'s onclose would otherwise ALSO fire its own
+      // connection-lost error for the very same stall this just reported more specifically
+      // (connect() resets closedByUs to false on the next attempt, so a retry is unaffected).
+      if (this.ws) {
+        this.closedByUs = true;
+        try {
+          this.ws.close();
+        } catch {
+          /* best-effort */
+        }
+        this.ws = null;
+      }
+    }, this.connectTimeoutMs);
+  }
+
+  private clearConnectTimeout(): void {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
   }
 
   /** Send the pending host/join request over the (open) socket. */
@@ -138,6 +183,7 @@ export class OnlineTransport implements Transport {
     try {
       ws = new this.WebSocketImpl(this.url);
     } catch {
+      this.clearConnectTimeout();
       this.emit({ type: 'error', reason: 'connect-failed' });
       return;
     }
@@ -149,6 +195,8 @@ export class OnlineTransport implements Transport {
       // A failed connection / dropped link surfaces via `onclose`; nothing to do here.
     };
     ws.onclose = () => {
+      // A no-op if the connect timeout already fired and closed this socket itself.
+      this.clearConnectTimeout();
       this.ws = null;
       if (!this.closedByUs) {
         this.emit({ type: 'error', reason: 'connection-lost' });
@@ -172,6 +220,7 @@ export class OnlineTransport implements Transport {
     }
     switch (msg.type) {
       case 'hosted':
+        this.clearConnectTimeout();
         this.emit({
           type: 'hosting',
           code: msg.code ?? '',
@@ -179,6 +228,7 @@ export class OnlineTransport implements Transport {
         });
         break;
       case 'joined':
+        this.clearConnectTimeout();
         this.emit({
           type: 'joined',
           code: msg.code ?? '',
@@ -196,6 +246,7 @@ export class OnlineTransport implements Transport {
         this.emit({ type: 'message', from: msg.from ?? '', data: msg.data });
         break;
       case 'error':
+        this.clearConnectTimeout();
         this.emit({ type: 'error', reason: msg.reason ?? 'unknown' });
         break;
       // 'pong' and anything else — ignored.

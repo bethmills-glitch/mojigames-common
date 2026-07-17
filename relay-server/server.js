@@ -29,6 +29,39 @@ const CODE_ALPHABET = 'ACDEFGHJKMNPQRSTUVWXYZ23456789';
 /** Live rooms — `code` → `{ size, peers: Map<peerId, ws> }`. */
 const rooms = new Map();
 
+// ── Rate limiting ────────────────────────────────────────────────────────────────────
+// A 2026-07-17 audit found nothing here throttled room-code guessing (4-char/30-symbol
+// alphabet = 810,000 combinations — scriptable in minutes against a live relay with no
+// limit) or unbounded connection creation (a resource-exhaustion DoS). Two independent,
+// deliberately simple limits — not trying to stop a determined, distributed attacker,
+// just raising the cost enough that casual guessing/flooding against a free kids'-game
+// relay isn't a five-minute script:
+//   • per-connection: close a socket once it racks up too many wrong-code guesses in a
+//     row — a real player mistyping a code a few times never gets close to this.
+//   • per-IP: cap how many NEW connections one address can open per window, so closing a
+//     spamming connection can't just be defeated by reconnecting immediately. Best-effort:
+//     if this relay ever sits behind a proxy/tunnel that doesn't forward the real client
+//     IP, every client behind it shares one bucket — that fails toward over-throttling a
+//     shared address, never toward silently doing nothing.
+const MAX_FAILED_JOINS_PER_CONNECTION = 5;
+const MAX_CONNECTIONS_PER_IP_PER_WINDOW = 20;
+const CONNECTION_WINDOW_MS = 10_000;
+
+/** IP → `{ count, windowStart }` for the per-IP connection-rate limit. */
+const connectionCounts = new Map();
+
+/** True if `ip` is still under its connection budget for the current window. */
+function ipAllowed(ip) {
+  const now = Date.now();
+  const entry = connectionCounts.get(ip);
+  if (!entry || now - entry.windowStart > CONNECTION_WINDOW_MS) {
+    connectionCounts.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= MAX_CONNECTIONS_PER_IP_PER_WINDOW;
+}
+
 /** A fresh, currently-unused room code. */
 function makeCode() {
   let code;
@@ -86,7 +119,13 @@ function handleJoin(ws, msg) {
   const code = String(msg.code || '').toUpperCase().trim();
   const room = rooms.get(code);
   if (!room) {
+    // Only a WRONG code counts toward the brute-force limit — a real code that's merely
+    // full (below) means they already had it, which isn't a guessing signal.
+    ws.failedJoins += 1;
     send(ws, { type: 'error', reason: 'no-room', code });
+    if (ws.failedJoins >= MAX_FAILED_JOINS_PER_CONNECTION) {
+      ws.close(1008, 'too many wrong codes');
+    }
     return;
   }
   if (room.peers.size >= room.size) {
@@ -123,9 +162,16 @@ const httpServer = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 1 << 20 });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  const ip = req.socket.remoteAddress || 'unknown';
+  if (!ipAllowed(ip)) {
+    ws.close(1008, 'too many connections, slow down');
+    return;
+  }
+
   ws.peerId = crypto.randomUUID();
   ws.roomCode = null;
+  ws.failedJoins = 0;
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -174,6 +220,15 @@ const heartbeat = setInterval(() => {
   }
 }, HEARTBEAT_MS);
 wss.on('close', () => clearInterval(heartbeat));
+
+// Forget IPs that have gone quiet, so this map doesn't grow forever.
+const rateLimitSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of connectionCounts) {
+    if (now - entry.windowStart > CONNECTION_WINDOW_MS) connectionCounts.delete(ip);
+  }
+}, CONNECTION_WINDOW_MS);
+wss.on('close', () => clearInterval(rateLimitSweep));
 
 httpServer.listen(PORT, () => {
   console.log(`Emoji Encore relay server listening on :${PORT}`);

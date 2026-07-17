@@ -20,11 +20,17 @@ function connect() {
     const ws = new WebSocket(URL);
     const queue = [];
     const waiters = [];
+    let closed = false;
+    const closeWaiters = [];
     ws.on('message', (raw) => {
       const msg = JSON.parse(raw.toString());
       const waiter = waiters.shift();
       if (waiter) waiter(msg);
       else queue.push(msg);
+    });
+    ws.on('close', () => {
+      closed = true;
+      while (closeWaiters.length) closeWaiters.shift()();
     });
     ws.on('error', reject);
     ws.on('open', () =>
@@ -37,6 +43,16 @@ function connect() {
             else waiters.push(res);
           }),
         close: () => ws.close(),
+        // Resolves once the server closes this connection (already-closed resolves at once).
+        waitForClose: (timeoutMs = 1000) =>
+          new Promise((res) => {
+            if (closed) return res(true);
+            const timer = setTimeout(() => res(false), timeoutMs);
+            closeWaiters.push(() => {
+              clearTimeout(timer);
+              res(true);
+            });
+          }),
       }),
     );
   });
@@ -94,7 +110,17 @@ function connect() {
     'joining an unknown code returns a no-room error',
     noRoom.type === 'error' && noRoom.reason === 'no-room',
   );
-  stray.close();
+
+  // Repeated wrong-code guessing on the SAME connection gets rate-limited (4 more, for 5
+  // total — MAX_FAILED_JOINS_PER_CONNECTION in server.js).
+  for (let i = 0; i < 4; i++) {
+    stray.send({ type: 'join', code: 'ZZZZ' });
+    await stray.next();
+  }
+  check(
+    'a connection that keeps guessing wrong codes gets closed by the server',
+    await stray.waitForClose(),
+  );
 
   // A third client cannot join a full 2-player room.
   const third = await connect();
