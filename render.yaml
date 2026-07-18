@@ -1,0 +1,27 @@
+# Render Blueprint — deploys the shared Mojigames online-multiplayer relay server.
+#
+# This relay is game-agnostic: one deployment backs online play for every Mojigames title
+# (Mojino, Mojiventure, HitMoji). Rooms are keyed by share code only, with no game-type field,
+# so all three apps can safely point at the same instance at once.
+#
+# How to use (one time):
+#   1. Push this repo to GitHub (it already is: bethmills-glitch/mojigames-common).
+#   2. Go to https://render.com → New → Blueprint → connect this repo.
+#   3. Render reads this file, builds `relay-server`, and gives you a public URL like
+#      https://mojigames-relay.onrender.com  (the WebSocket URL is the same with wss://).
+#   4. Set EXPO_PUBLIC_RELAY_URL=wss://mojigames-relay.onrender.com when building each app
+#      for production (Mojino, Mojiventure, HitMoji all read this same env var — see each
+#      app's src/multiplayer/config.ts).
+#
+# Note: the free plan sleeps after ~15 min idle, so the very first host of a session may
+# wait ~30-60s while it wakes. Upgrade the plan to keep it always-on.
+services:
+  - type: web
+    name: mojigames-relay
+    runtime: node
+    plan: free
+    rootDir: relay-server
+    buildCommand: npm install
+    startCommand: npm start
+    # The server answers a plain GET with 200 OK, so the default "/" health check passes.
+    healthCheckPath: /
