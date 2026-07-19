@@ -18,3 +18,4 @@ export {
   type Gradient,
 } from './theme';
 export { GradientPill, type GradientPillProps } from './GradientPill';
+export { HourglassSpinner, type HourglassSpinnerProps } from './HourglassSpinner';
