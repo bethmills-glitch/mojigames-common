@@ -98,6 +98,38 @@ describe('useParty — host', () => {
     expect(party().members.map((m) => m.id)).toEqual([HOST_ID]);
     expect(party().progress).toEqual({});
   });
+
+  it('turns away a hello that arrives after the match has started (no ghost roster)', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, 4);
+
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+    fake.fire({ type: 'peer-join', peerId: 'g1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    act(() => party().start({ items: [1, 2, 3] }));
+
+    // A latecomer connects AFTER start → must NOT be seated (no ghost), and is told the room is
+    // closed so its own screen can bail instead of hanging on the lobby forever.
+    fake.fire({ type: 'peer-join', peerId: 'late' });
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']);
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'late', reason: 'in-progress' });
+  });
+
+  it('turns away (and tells) a hello once the room is full', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, 2); // host + 1 only
+
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // room now full (2/2)
+
+    fake.fire({ type: 'message', from: 'g2', data: { t: 'party:hello', id: 'g2', name: 'Cy', meta: { avatar: '🐧' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // not seated
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'g2', reason: 'room-full' });
+  });
 });
 
 describe('useParty — guest', () => {
@@ -130,5 +162,24 @@ describe('useParty — guest', () => {
     fake.fire({ type: 'peer-leave', peerId: 'h1' });
     expect(party().status).toBe('error');
     expect(party().error).toBe('host-left');
+  });
+
+  it('errors when the host closes the room to it, but ignores a close aimed elsewhere', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1'] });
+    expect(party().status).toBe('connected');
+
+    // A close aimed at a DIFFERENT id must be ignored — a guest already in the match receives
+    // the same broadcast and must not error on someone else's rejection.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'someone-else', reason: 'in-progress' } });
+    expect(party().status).toBe('connected');
+
+    // A close aimed at THIS device flips it to a showable error instead of a silent hang.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'in-progress' } });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('match-started');
   });
 });

@@ -51,7 +51,8 @@ type ProtocolMessage<TStart, TProgress, TMeta> =
   | { t: 'party:roster'; members: PartyMember<TMeta>[] }
   | { t: 'party:start'; payload: TStart; members: PartyMember<TMeta>[] }
   | { t: 'party:progress'; id: string; progress: TProgress }
-  | { t: 'party:leave'; id: string };
+  | { t: 'party:leave'; id: string }
+  | { t: 'party:closed'; id: string; reason: 'in-progress' | 'room-full' };
 
 export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
   status: MultiplayerStatus;
@@ -124,6 +125,13 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
   // Guest only: the host's transport PeerId (the first peer in `joined`), so a `peer-leave`
   // for the host ends the session, while another guest leaving does not.
   const hostPeerRef = useRef<string | null>(null);
+  // This device's roster id, mirrored into a ref so a transport callback can match a targeted
+  // `party:closed` against it without re-subscribing.
+  const selfIdRef = useRef<string | null>(null);
+  // Host: flips true once `start()` freezes the roster. A `party:hello` after this is a
+  // latecomer the host turns away — seating them would add a ghost that never receives the
+  // one-shot `party:start` and hangs on the lobby forever.
+  const startedRef = useRef(false);
   const maxPlayers = options.maxPlayers ?? DEFAULT_MAX_PLAYERS;
   const optsRef = useRef(options);
   optsRef.current = options;
@@ -152,7 +160,14 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
         case 'party:hello': {
           if (role !== 'host') return;
           const cur = rosterRef.current;
-          if (cur.some((m) => m.id === msg.id) || cur.length >= maxPlayers) return;
+          if (cur.some((m) => m.id === msg.id)) return; // a duplicate hello — already seated
+          // Match already running, or the room is full → turn the latecomer away instead of
+          // seating a ghost. The reply is broadcast (transports have no unicast) and matched by
+          // `id` on the far side, so only this joiner reacts.
+          if (startedRef.current || cur.length >= maxPlayers) {
+            rawSend({ t: 'party:closed', id: msg.id, reason: startedRef.current ? 'in-progress' : 'room-full' } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+            return;
+          }
           setRoster([...cur, { id: msg.id, name: msg.name || 'Player', meta: msg.meta }]);
           break;
         }
@@ -171,6 +186,14 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
             setProgress((cur) => dropKey(cur, msg.id));
           }
           break;
+        case 'party:closed':
+          // The host turned this device away (match already running, or room full). Only the
+          // targeted joiner reacts — guests already in the room ignore it.
+          if (role === 'guest' && msg.id === selfIdRef.current) {
+            setError(msg.reason === 'room-full' ? 'room-full' : 'match-started');
+            setStatus('error');
+          }
+          break;
         case 'party:progress':
           setProgress((cur) => ({ ...cur, [msg.id]: msg.progress }));
           break;
@@ -178,7 +201,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
           optsRef.current.onGameMessage?.(from, data);
       }
     },
-    [maxPlayers, setRoster],
+    [maxPlayers, setRoster, rawSend],
   );
 
   const handleEvent = useCallback(
@@ -187,6 +210,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
         case 'hosting': {
           setCode(event.code);
           setSelfId(HOST_ID);
+          selfIdRef.current = HOST_ID;
           const seed: PartyMember<TMeta> = { id: HOST_ID, name: optsRef.current.self.name, meta: optsRef.current.self.meta };
           rosterRef.current = [seed];
           setMembers([seed]);
@@ -196,6 +220,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
         case 'joined':
           setCode(event.code);
           setSelfId(event.selfId);
+          selfIdRef.current = event.selfId;
           hostPeerRef.current = event.peers[0] ?? null; // the room creator is listed first
           setStatus('connected');
           rawSend({ t: 'party:hello', id: event.selfId, name: optsRef.current.self.name, meta: optsRef.current.self.meta } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
@@ -261,6 +286,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
   const start = useCallback(
     (payload: TStart) => {
       if (roleRef.current !== 'host') return;
+      startedRef.current = true;
       const frozen = rosterRef.current;
       rawSend({ t: 'party:start', payload, members: frozen } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
       setMatch({ payload, members: frozen });
@@ -286,6 +312,8 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
     roleRef.current = null;
     rosterRef.current = [];
     hostPeerRef.current = null;
+    selfIdRef.current = null;
+    startedRef.current = false;
     setStatus('closed');
     setPhase('lobby');
     setMatch(null);
