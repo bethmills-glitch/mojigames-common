@@ -132,6 +132,16 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
   // latecomer the host turns away — seating them would add a ghost that never receives the
   // one-shot `party:start` and hangs on the lobby forever.
   const startedRef = useRef(false);
+  // Host only: maps a guest's TRANSPORT-level peer id (from `handleProtocol`'s `from`, i.e.
+  // what a `peer-leave` will later report) → the roster id they registered under in their
+  // `party:hello` (`msg.id`, self-reported). On `OnlineTransport` these are already the same
+  // value — the relay mints one id per socket and uses it everywhere — so the fallback in
+  // `peer-leave` below is a no-op there. On `NearbyTransport` they are DIFFERENT id
+  // namespaces (each side's native stack — MultipeerConnectivity / Nearby Connections —
+  // assigns its own local id for a connection, independently of the other side), so without
+  // this mapping a `peer-leave` could never be correlated back to the roster entry it
+  // should remove — the departed guest would linger as a ghost forever.
+  const transportIdToRosterId = useRef<Map<string, string>>(new Map());
   const maxPlayers = options.maxPlayers ?? DEFAULT_MAX_PLAYERS;
   const optsRef = useRef(options);
   optsRef.current = options;
@@ -168,6 +178,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
             rawSend({ t: 'party:closed', id: msg.id, reason: startedRef.current ? 'in-progress' : 'room-full' } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
             return;
           }
+          transportIdToRosterId.current.set(from, msg.id);
           setRoster([...cur, { id: msg.id, name: msg.name || 'Player', meta: msg.meta }]);
           break;
         }
@@ -232,9 +243,14 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
           break;
         case 'peer-leave':
           if (roleRef.current === 'host') {
-            setRoster(rosterRef.current.filter((m) => m.id !== event.peerId));
-            rawSend({ t: 'party:leave', id: event.peerId } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
-            setProgress((cur) => dropKey(cur, event.peerId));
+            // Translate the transport's own peer id to the roster id that guest registered
+            // under in `party:hello` (see transportIdToRosterId above) — on nearby these
+            // differ; on online the fallback is a no-op since they already coincide.
+            const rosterId = transportIdToRosterId.current.get(event.peerId) ?? event.peerId;
+            transportIdToRosterId.current.delete(event.peerId);
+            setRoster(rosterRef.current.filter((m) => m.id !== rosterId));
+            rawSend({ t: 'party:leave', id: rosterId } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+            setProgress((cur) => dropKey(cur, rosterId));
           } else if (event.peerId === hostPeerRef.current) {
             setError('host-left');
             setStatus('error');
@@ -314,6 +330,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
     hostPeerRef.current = null;
     selfIdRef.current = null;
     startedRef.current = false;
+    transportIdToRosterId.current.clear();
     setStatus('closed');
     setPhase('lobby');
     setMatch(null);

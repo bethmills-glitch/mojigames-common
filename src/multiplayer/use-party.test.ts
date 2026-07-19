@@ -99,6 +99,38 @@ describe('useParty — host', () => {
     expect(party().progress).toEqual({});
   });
 
+  it('prunes a departed guest even when its self-reported id differs from its transport peer id', () => {
+    // On OnlineTransport a guest's own `selfId` and the id everyone else sees for it in
+    // peer-join/peer-leave/message are the SAME string (the relay mints one id per socket).
+    // On NearbyTransport they are NOT — each side's native stack (MultipeerConnectivity /
+    // Nearby Connections) assigns its own local id for a connection, independently of the
+    // other side. This test uses two DIFFERENT strings for "the same real guest" — exactly
+    // like nearby-transport.test.ts's own 'guest-self' vs 'guest-1' — to prove the roster
+    // still gets pruned on leave, instead of the departed guest lingering as a ghost forever.
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, 4);
+
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+
+    // The guest's `party:hello` is DELIVERED from transport id 'guest-1' (the host's own
+    // local view of that connection), but its PAYLOAD carries the guest's self-reported id
+    // 'guest-self' — the value the guest itself believes is its `selfId`.
+    fake.fire({ type: 'peer-join', peerId: 'guest-1' });
+    fake.fire({ type: 'message', from: 'guest-1', data: { t: 'party:hello', id: 'guest-self', name: 'Bo', meta: { avatar: '🐼' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'guest-self']); // seated by self-reported id, unchanged
+
+    fake.fire({ type: 'message', from: 'guest-1', data: { t: 'party:progress', id: 'guest-self', progress: { score: 30 } } });
+    expect(party().progress).toEqual({ 'guest-self': { score: 30 } });
+
+    // The guest disconnects — the transport reports its OWN (host-side) view of the peer,
+    // 'guest-1', which never matches 'guest-self' by simple equality.
+    fake.fire({ type: 'peer-leave', peerId: 'guest-1' });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID]); // pruned, not a lingering ghost
+    expect(party().progress).toEqual({});
+    expect(lastSent(fake.sent, 'party:leave')).toMatchObject({ id: 'guest-self' }); // guests told by the id THEY know
+  });
+
   it('turns away a hello that arrives after the match has started (no ghost roster)', () => {
     const fake = createFakeTransport();
     const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, 4);
