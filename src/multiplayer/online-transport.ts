@@ -35,9 +35,13 @@ export interface OnlineTransportOptions {
 /** The OPEN ready-state value — identical (`1`) across every WebSocket implementation. */
 const WS_OPEN = 1;
 
-/** How long to wait for the relay to answer a host/join request before giving up. Matches
- *  NearbyTransport's DEFAULT_CONNECT_TIMEOUT_MS so both transports fail at the same pace. */
-const DEFAULT_CONNECT_TIMEOUT_MS = 25_000;
+/** How long to wait for the relay to answer a host/join request before giving up. Longer than
+ *  NearbyTransport's timeout on purpose: the shared relay runs on Render's free tier, which
+ *  sleeps after ~15 min idle and can take 30-60s to wake on the next request. 25s (this used to
+ *  match Nearby's timeout) meant the very first host/join of a session reliably timed out before
+ *  the relay finished waking — the connection then gets torn down and never recovers even though
+ *  the relay comes up seconds later. 70s comfortably clears Render's documented worst case. */
+const DEFAULT_CONNECT_TIMEOUT_MS = 70_000;
 
 /** A parsed inbound relay message — only the fields this transport reads, all optional. */
 interface RelayMessage {
