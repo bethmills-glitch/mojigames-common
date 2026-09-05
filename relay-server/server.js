@@ -1,10 +1,10 @@
-// Emoji Encore — multiplayer relay server.
+// Mojigames — multiplayer relay server.
 //
 // A tiny, game-agnostic WebSocket relay. A player HOSTs a room (the server mints a short
 // share code) or JOINs an existing one by code; thereafter every message a player sends
 // is relayed verbatim to the other player(s) in the same room. The server never inspects
 // or interprets the `data` payload — the game protocol lives entirely in the client
-// (packages/multiplayer) — so this same relay can back any game, not just Emoji Encore.
+// (packages/multiplayer) — so this one relay backs the online play of every Mojigames game at once.
 //
 // Protocol (JSON text frames over WebSocket) — see README.md for the full table.
 //   client → server : {type:'host', size?}  {type:'join', code}  {type:'msg', data}  {type:'ping'}
@@ -157,7 +157,7 @@ function handleMsg(ws, msg) {
 
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Emoji Encore relay server — ok\n');
+  res.end('Mojigames relay server — ok\n');
 });
 
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 1 << 20 });
@@ -231,5 +231,5 @@ const rateLimitSweep = setInterval(() => {
 wss.on('close', () => clearInterval(rateLimitSweep));
 
 httpServer.listen(PORT, () => {
-  console.log(`Emoji Encore relay server listening on :${PORT}`);
+  console.log(`Mojigames relay server listening on :${PORT}`);
 });
