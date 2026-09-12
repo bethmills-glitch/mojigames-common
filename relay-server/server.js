@@ -133,6 +133,10 @@ function handleJoin(ws, msg) {
     return;
   }
   if (ws.roomCode) leaveRoom(ws);
+  // A correct code clears the brute-force tally. Without this the count only ever grows,
+  // so a player who mistypes a code five times over one session — with successful joins in
+  // between — has their socket closed and is wrongly told they lost their internet.
+  ws.failedJoins = 0;
   // Hand the joiner the peers already present, then add them and announce to the rest.
   const existingPeers = [...room.peers.keys()];
   room.peers.set(ws.peerId, ws);

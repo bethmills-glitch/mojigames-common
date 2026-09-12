@@ -252,6 +252,13 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
             rawSend({ t: 'party:leave', id: rosterId } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
             setProgress((cur) => dropKey(cur, rosterId));
           } else if (event.peerId === hostPeerRef.current) {
+            // The host is gone. Flagging the error is not enough: without this the host
+            // stays on the guest's roster, so their row sits frozen on the leaderboard,
+            // any "has everyone finished?" check waits forever on a player who left, and
+            // a host who quits while ahead can still be crowned the winner. Prune them the
+            // same way the host prunes a departing guest just above.
+            setMembers((cur) => cur.filter((m) => m.id !== HOST_ID));
+            setProgress((cur) => dropKey(cur, HOST_ID));
             setError('host-left');
             setStatus('error');
           }

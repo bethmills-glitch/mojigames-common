@@ -196,6 +196,34 @@ describe('useParty — guest', () => {
     expect(party().error).toBe('host-left');
   });
 
+  it('drops the host from the roster when it leaves, so nothing waits on a departed player', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+
+    const roster = [
+      { id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } },
+      { id: 'g1', name: 'Bo', meta: { avatar: '🐼' } },
+    ];
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: roster } });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [7, 8] }, members: roster } });
+    // The host reports some progress, then quits mid-match.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:progress', id: HOST_ID, progress: { score: 500 } } });
+    expect(party().progress[HOST_ID]).toEqual({ score: 500 });
+
+    fake.fire({ type: 'peer-leave', peerId: 'h1' });
+
+    // Only the guest is left. If the host lingered here its row would stay frozen on the
+    // leaderboard, "has everyone finished?" would never be true, and a host who quit while
+    // ahead could still win.
+    expect(party().members.map((m) => m.id)).toEqual(['g1']);
+    expect(party().progress[HOST_ID]).toBeUndefined();
+    // The frozen match roster is deliberately untouched — it is the record of who started.
+    expect(party().match?.members.map((m) => m.id)).toEqual([HOST_ID, 'g1']);
+  });
+
   it('errors when the host closes the room to it, but ignores a close aimed elsewhere', () => {
     const fake = createFakeTransport();
     const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
