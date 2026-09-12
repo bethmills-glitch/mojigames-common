@@ -232,7 +232,25 @@ describe('NearbyTransport — guest', () => {
     expect(joined[0].peers).toEqual(['our-host']);
   });
 
-  it('emits `no-room` when no advertiser with the code turns up in time', async () => {
+  // The two scan failures below look identical to a player but have opposite fixes, so the
+  // transport reports them separately: `no-room` means "retype the code", `no-peers-found`
+  // means "discovery is not working on this phone at all".
+  it('emits `no-room` when other rooms were seen but never the typed code', async () => {
+    const fake = createFakeNearby();
+    const transport = new NearbyTransport({ nearby: fake.api, connectTimeoutMs: 40 });
+    const events = collect(transport);
+
+    transport.join('WXYZ');
+    await flush();
+    fake.fire.peerFound({ peerId: 'someone-elses-host', name: 'ABCD' });
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+
+    const errors = eventsOfType(events, 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].reason).toBe('no-room');
+  });
+
+  it('emits `no-peers-found` when discovery surfaced nothing at all', async () => {
     const fake = createFakeNearby();
     const transport = new NearbyTransport({ nearby: fake.api, connectTimeoutMs: 40 });
     const events = collect(transport);
@@ -243,7 +261,7 @@ describe('NearbyTransport — guest', () => {
 
     const errors = eventsOfType(events, 'error');
     expect(errors).toHaveLength(1);
-    expect(errors[0].reason).toBe('no-room');
+    expect(errors[0].reason).toBe('no-peers-found');
   });
 });
 

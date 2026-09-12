@@ -146,6 +146,17 @@ export class NearbyTransport implements Transport {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Set once `host()`/`join()` has run — each transport hosts or joins exactly once. */
   private started = false;
+  /**
+   * Guest: did discovery surface ANY advertiser, matching code or not?
+   *
+   * This is the difference between two failures that look identical to a player but have
+   * opposite fixes. If we saw other devices, discovery works and the code was wrong or the
+   * host had stopped hosting. If we saw nothing at all in 25 seconds, discovery itself is
+   * dead — Bluetooth off, a missing runtime permission, or a device without Google Play
+   * services — and re-typing the code will never help. Reporting both as `no-room` sent a
+   * real player (and the session debugging this) down the wrong path.
+   */
+  private sawAnyPeer = false;
   private closed = false;
 
   constructor(options: NearbyTransportOptions = {}) {
@@ -282,6 +293,7 @@ export class NearbyTransport implements Transport {
     if (this.role !== 'guest' || this.closed) return;
     // The guest only ever connects to ONE host. Once we have a connection or one is in
     // flight, ignore any further peers found (they may be other hosts on different codes).
+    this.sawAnyPeer = true;
     if (this.connectedPeers.size > 0 || this.pendingPeers.size > 0) return;
     if (peer.name.toUpperCase().trim() !== this.code) return; // a different room
     this.pendingPeers.add(peer.peerId);
@@ -391,8 +403,9 @@ export class NearbyTransport implements Transport {
     this.connectTimer = setTimeout(() => {
       this.connectTimer = null;
       if (this.closed || this.connectedPeers.size > 0) return;
-      // No advertiser with this code connected — a wrong code, or the host is not hosting.
-      this.emit({ type: 'error', reason: 'no-room' });
+      // Saw other devices but never this code: a wrong code, or the host stopped hosting.
+      // Saw nothing at all: discovery is not working on this device (see `sawAnyPeer`).
+      this.emit({ type: 'error', reason: this.sawAnyPeer ? 'no-room' : 'no-peers-found' });
       void this.nearby?.stopDiscovery().catch(() => {});
     }, this.connectTimeoutMs);
   }

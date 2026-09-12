@@ -55,15 +55,26 @@ export async function ensureNearbyPermissions(): Promise<boolean> {
   if (Platform.OS !== 'android') return true;
   const api = typeof Platform.Version === 'number' ? Platform.Version : 0;
   const P = PermissionsAndroid.PERMISSIONS;
-  // Android 12+ (API 31): the granular Bluetooth permissions — and NO location. The consuming
-  // apps' manifests declare BLUETOOTH_SCAN with usesPermissionFlags="neverForLocation" (we never
-  // derive location from scans), which is what lets Nearby Connections run location-free on
-  // modern Android. These are kids' apps: a location prompt they don't need is a Families-review
-  // red flag and a scary parent moment. Wi-Fi-based discovery adds NEARBY_WIFI_DEVICES on 13+.
+  // Android 12+ (API 31): the granular Bluetooth permissions — and, from API 32, NO location.
+  // The consuming apps' manifests declare BLUETOOTH_SCAN with usesPermissionFlags=
+  // "neverForLocation" (we never derive location from scans), which is what lets Nearby
+  // Connections run location-free on modern Android. These are kids' apps: a location prompt
+  // they don't need is a Families-review red flag and a scary parent moment. Wi-Fi-based
+  // discovery adds NEARBY_WIFI_DEVICES on 13+ (Google's table says 32, but the permission
+  // string only exists from 33, and requesting an unknown permission reads back as denied).
   // Android 11 and older gate BLE scanning behind (fine) location — unavoidable there.
+  //
+  // API 31 exactly (Android 12.0) is the awkward middle: Google's reference manifest bounds
+  // ACCESS_FINE_LOCATION as minSdk 29 / maxSdk 31, so Nearby still requires it there, and
+  // "if the user does not grant all required permissions, the Nearby Connections API will
+  // refuse to allow your app to start advertising or discovering". Skipping it on 31 — as
+  // this function did until 2026-09-12 — silently broke in-person play on every Android 12.0
+  // phone: permissions all read as granted, and advertise/discover then does nothing.
+  // https://developers.google.com/nearby/connections/android/get-started
   const wanted: AndroidPermission[] = [];
   if (api >= 31) {
     wanted.push(P.BLUETOOTH_ADVERTISE, P.BLUETOOTH_CONNECT, P.BLUETOOTH_SCAN);
+    if (api === 31) wanted.push(P.ACCESS_FINE_LOCATION);
     if (api >= 33) wanted.push(P.NEARBY_WIFI_DEVICES);
   } else {
     wanted.push(P.ACCESS_FINE_LOCATION);
