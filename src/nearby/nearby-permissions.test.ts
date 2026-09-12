@@ -67,6 +67,32 @@ describe('ensureNearbyPermissions', () => {
     expect(asked()).not.toContain(PERMISSIONS.NEARBY_WIFI_DEVICES);
   });
 
+  it('does not fail on Android 12.0 when location is refused or undeclared', async () => {
+    // Fine location is asked for but treated as optional there: whether it is even declared
+    // is each app's manifest decision (Mojiventure caps it at API 30 on purpose), and an
+    // undeclared permission reads back as denied. Failing here would be a dead end — there
+    // would be nothing for the player to grant.
+    onApi(31);
+    requestMultiple.mockResolvedValue({
+      [PERMISSIONS.BLUETOOTH_ADVERTISE]: 'granted',
+      [PERMISSIONS.BLUETOOTH_CONNECT]: 'granted',
+      [PERMISSIONS.BLUETOOTH_SCAN]: 'granted',
+      [PERMISSIONS.ACCESS_FINE_LOCATION]: 'denied',
+    });
+    await expect(ensureNearbyPermissions()).resolves.toBe(true);
+  });
+
+  it('still fails on Android 12.0 when a Bluetooth permission is refused', async () => {
+    onApi(31);
+    requestMultiple.mockResolvedValue({
+      [PERMISSIONS.BLUETOOTH_ADVERTISE]: 'granted',
+      [PERMISSIONS.BLUETOOTH_CONNECT]: 'denied',
+      [PERMISSIONS.BLUETOOTH_SCAN]: 'granted',
+      [PERMISSIONS.ACCESS_FINE_LOCATION]: 'granted',
+    });
+    await expect(ensureNearbyPermissions()).resolves.toBe(false);
+  });
+
   it('drops location from Android 12L, where Bluetooth alone carries discovery', async () => {
     onApi(32);
     await expect(ensureNearbyPermissions()).resolves.toBe(true);

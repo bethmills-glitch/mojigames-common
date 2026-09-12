@@ -71,16 +71,28 @@ export async function ensureNearbyPermissions(): Promise<boolean> {
   // this function did until 2026-09-12 — silently broke in-person play on every Android 12.0
   // phone: permissions all read as granted, and advertise/discover then does nothing.
   // https://developers.google.com/nearby/connections/android/get-started
+  //
+  // It is asked for as OPTIONAL rather than required, because whether that permission even
+  // EXISTS on API 31 is each app's own manifest decision and this library must not depend on
+  // one: HitMoji and Mojino cap it at maxSdkVersion 31 so it is there, while Mojiventure
+  // caps it at 30 on purpose (Play's Designed-for-Families review treats location in a kids'
+  // app as high-risk, and that call is not this file's to make). Requesting an undeclared
+  // permission reads back as denied, so treating it as required would have turned Mojiventure's
+  // Android 12.0 users from "in-person play quietly does not work" into "permission denied" —
+  // a dead end, since there is no permission there for them to grant. Depending on a manifest
+  // detail in another repo is the exact bug this whole change is fixing, so: ask, use it if
+  // it is granted, and let NearbyTransport's `no-peers-found` report the failure if it is not.
   const wanted: AndroidPermission[] = [];
+  const optional: AndroidPermission[] = [];
   if (api >= 31) {
     wanted.push(P.BLUETOOTH_ADVERTISE, P.BLUETOOTH_CONNECT, P.BLUETOOTH_SCAN);
-    if (api === 31) wanted.push(P.ACCESS_FINE_LOCATION);
+    if (api === 31) optional.push(P.ACCESS_FINE_LOCATION);
     if (api >= 33) wanted.push(P.NEARBY_WIFI_DEVICES);
   } else {
     wanted.push(P.ACCESS_FINE_LOCATION);
   }
   try {
-    const result = await PermissionsAndroid.requestMultiple(wanted);
+    const result = await PermissionsAndroid.requestMultiple([...wanted, ...optional]);
     return wanted.every((p) => result[p] === PermissionsAndroid.RESULTS.GRANTED);
   } catch {
     return false;
