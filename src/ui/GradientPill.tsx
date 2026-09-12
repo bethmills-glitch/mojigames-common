@@ -24,7 +24,7 @@ export interface GradientPillProps {
   icon?: string;
   /** Button label. */
   label?: string;
-  /** When false the pill dims to 0.55 — use for the unselected items in a picker. Default true. */
+  /** When false the pill dims to 0.8 — use for the unselected items in a picker. Default true. */
   selected?: boolean;
   /** Tap handler. */
   onPress?: () => void;
@@ -91,7 +91,11 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     elevation: 10,
   },
-  dim: { opacity: 0.55 },
+  // Unselected siblings. 0.55 was too deep on HitMoji's light pastel backgrounds: the
+  // unpicked category pills read as disabled rather than merely unpicked, and Beth reported
+  // the whole picker as "see through and all faded". 0.8 still reads clearly as secondary
+  // next to the white selection ring on the picked pill, without looking switched off.
+  dim: { opacity: 0.8 },
   pressed: { opacity: 0.85 },
   grad: {
     borderRadius: Radius.md,
