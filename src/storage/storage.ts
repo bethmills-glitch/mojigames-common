@@ -5,7 +5,9 @@
 // gets its own key namespace — two games on one device never collide.
 //
 // Every operation is best-effort: a storage error is swallowed and treated as "absent"
-// rather than thrown, so a full disk or private-mode quirk can never crash the game.
+// rather than thrown, so a full disk or private-mode quirk can never crash the game. The ONE
+// exception is the versioned wipe — see checkAndApplyWipe, where "I could not read it" must never
+// be mistaken for "there is no marker", because that answer erases everything the player has.
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -130,7 +132,18 @@ export function createStorage(config: StorageConfig): Storage {
   };
 
   const checkAndApplyWipe = async (): Promise<boolean> => {
-    const stored = await getString(WIPE_APPLIED_KEY);
+    let stored: string | null;
+    try {
+      // Deliberately NOT getString(): that maps a read FAILURE to null, and null here means "no
+      // marker yet", which is what triggers the wipe. So a locked SQLite file or a moment of disk
+      // pressure during startup would delete every profile, stat, streak and daily result on the
+      // device — silently, and looking like a fresh install afterwards (2026-09-16 audit).
+      // Skipping a wipe is harmless: it simply runs on the next launch. Losing the player's data
+      // is not recoverable, so an unreadable marker must never be treated as a missing one.
+      stored = await AsyncStorage.getItem(ns(WIPE_APPLIED_KEY));
+    } catch {
+      return false;
+    }
     if (stored === config.wipeVersion) return false;
     await wipeAllData();
     await setString(WIPE_APPLIED_KEY, config.wipeVersion);

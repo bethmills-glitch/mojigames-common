@@ -144,6 +144,37 @@ describe('checkAndApplyWipe', () => {
     expect(await storage.getJSON('stats')).toEqual({ score: 5000 });
   });
 
+  it('does NOT wipe when the marker cannot be read', async () => {
+    // A read ERROR is not "there is no marker". Treating it as one deleted every profile, stat,
+    // streak and daily result on the device — silently, and looking like a fresh install
+    // afterwards (2026-09-16 audit). Skipping a wipe is harmless: it runs again next launch.
+    await storage.setString('wipeApplied', '6'); // stale on purpose: a wipe WOULD be due
+    await storage.setJSON('stats', { score: 5000 });
+    // Swapped by hand rather than with jest.spyOn: AsyncStorage here is the official in-memory
+    // jest mock, and restoring a spy on it leaves a bare jest.fn() in place — which silently broke
+    // every later read in this file.
+    const realGetItem = AsyncStorage.getItem;
+    let failedOnce = false;
+    AsyncStorage.getItem = ((key: string) => {
+      if (!failedOnce) {
+        failedOnce = true;
+        return Promise.reject(new Error('database is locked'));
+      }
+      return realGetItem(key);
+    }) as typeof AsyncStorage.getItem;
+
+    let wiped: boolean;
+    try {
+      wiped = await storage.checkAndApplyWipe();
+    } finally {
+      AsyncStorage.getItem = realGetItem;
+    }
+
+    expect(wiped).toBe(false);
+    expect(await storage.getJSON('stats')).toEqual({ score: 5000 });
+    expect(await storage.getString('wipeApplied')).toBe('6');
+  });
+
   it('wipes stale data when the marker is from an older version', async () => {
     await storage.setString('wipeApplied', '6'); // a previous wipeVersion
     await storage.setJSON('stats', { score: 5000 });
