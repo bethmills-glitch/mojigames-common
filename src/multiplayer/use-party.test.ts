@@ -162,6 +162,68 @@ describe('useParty — host', () => {
     expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // not seated
     expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'g2', reason: 'room-full' });
   });
+
+  it('returns everyone to the lobby after a match, keeping the room and its code alive', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, 4);
+
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    act(() => party().start({ items: [1, 2, 3] }));
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:progress', id: 'g1', progress: { score: 50 } } });
+    expect(party().phase).toBe('match');
+
+    act(() => party().endMatch());
+
+    // The room survives the game: same code, same roster, same socket. This is what lets one
+    // party play game after game instead of the host re-hosting and everyone re-typing a code.
+    expect(party().phase).toBe('lobby');
+    expect(party().match).toBeNull();
+    expect(party().code).toBe('WXYZ');
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']);
+    // Last game's scores must not bleed into the next game's leaderboard.
+    expect(party().progress).toEqual({});
+    expect(lastSent(fake.sent, 'party:lobby')).toMatchObject({ members: [{ id: HOST_ID }, { id: 'g1' }] });
+
+    // And the room RE-OPENS. The in-progress seal used to last the life of the room, so a
+    // friend whose phone dropped mid-game could never get back in.
+    fake.fire({ type: 'message', from: 'g2', data: { t: 'party:hello', id: 'g2', name: 'Cy', meta: { avatar: '🐧' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1', 'g2']);
+  });
+
+  it('re-seals the room on the NEXT start, so the ghost-roster bug cannot come back', () => {
+    // endMatch reopens the room; start must close it again. Without this the second game of a
+    // games night would happily seat a latecomer who never receives its one-shot `party:start`.
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, 8);
+
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    act(() => party().start({ items: [1] }));
+    act(() => party().endMatch());
+    act(() => party().start({ items: [2] }));
+
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Di', meta: { avatar: '🐨' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']);
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'late', reason: 'in-progress' });
+  });
+
+  it('ignores endMatch from a guest — returning to the lobby is the host’s call', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    const roster = [{ id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } }];
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [1] }, members: roster } });
+    expect(party().phase).toBe('match');
+
+    act(() => party().endMatch());
+    expect(party().phase).toBe('match'); // unchanged
+    expect(lastSent(fake.sent, 'party:lobby')).toBeUndefined();
+  });
 });
 
 describe('useParty — guest', () => {
@@ -241,5 +303,34 @@ describe('useParty — guest', () => {
     fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'in-progress' } });
     expect(party().status).toBe('error');
     expect(party().error).toBe('match-started');
+  });
+
+  it('follows the host back to the lobby between games, without re-joining', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+
+    const roster = [
+      { id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } },
+      { id: 'g1', name: 'Bo', meta: { avatar: '🐼' } },
+    ];
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [7, 8] }, members: roster } });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:progress', id: HOST_ID, progress: { score: 90 } } });
+    expect(party().phase).toBe('match');
+
+    // The host picks "back to the lobby" — everyone lands back in the SAME party.
+    const nextRoster = [...roster, { id: 'g2', name: 'Cy', meta: { avatar: '🐧' } }];
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:lobby', members: nextRoster } });
+
+    expect(party().phase).toBe('lobby');
+    expect(party().match).toBeNull();
+    expect(party().status).toBe('connected'); // still in the room — no reconnect, no code re-entry
+    expect(party().code).toBe('WXYZ');
+    // The live roster rides along, because party:start had overwritten `members` with the
+    // frozen copy — without it the lobby would show the wrong player list for the next game.
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1', 'g2']);
+    expect(party().progress).toEqual({});
   });
 });

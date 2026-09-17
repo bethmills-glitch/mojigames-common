@@ -23,7 +23,7 @@ changes.
 
 | Import | What it gives you |
 |---|---|
-| `mojigames-common/multiplayer` | The `Transport` interface (`host`/`join`/`send`/`close`/`subscribe`), `OnlineTransport` (a WebSocket relay client), the `useMultiplayer` React hook (transport-agnostic — the game injects a `createTransport` factory), and `useParty` (N-player, size-capped rooms). |
+| `mojigames-common/multiplayer` | The `Transport` interface (`host`/`join`/`send`/`close`/`subscribe`), `OnlineTransport` (a WebSocket relay client), the `useMultiplayer` React hook (transport-agnostic — the game injects a `createTransport` factory), and `useParty` (N-player, size-capped rooms; `start()` freezes the roster and seals the room for ONE match, `endMatch()` sends everyone back to the same lobby and re-opens it, so a single room can run game after game). |
 | `mojigames-common/nearby` | `NearbyTransport` — in-person play between two phones in the same room (Bluetooth / local Wi-Fi), no internet. It implements `Transport`, so it drops straight into `useMultiplayer`. |
 | `mojigames-common/storage` | `createStorage()` — a namespaced key/value store with a versioned wipe, over AsyncStorage. |
 | `relay-server/` | A standalone, game-agnostic WebSocket relay (Node + `ws`). Its **own mini-package** with its own `package.json` and `README.md`. Deploy once; every game's online play shares it. |

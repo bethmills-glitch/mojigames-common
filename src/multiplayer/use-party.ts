@@ -9,6 +9,10 @@
 //       host  → all   `party:leave`   (a player dropped)
 //   • a host-authoritative MATCH START — the host calls `start(payload)`, the opaque payload
 //     (e.g. the puzzle list + settings) is broadcast so every device plays the same set;
+//   • a host-authoritative RETURN TO THE LOBBY — `endMatch()` broadcasts `party:lobby`, so ONE
+//     room can host game after game (a "games night"): the share code, the socket and the
+//     roster all survive, and the room re-opens to joiners. Without it a room was sealed for
+//     life at the first Start, so every game meant a new room and a new code for everybody;
 //   • live PROGRESS — `reportProgress(p)` broadcasts, `progress` collects everyone else's
 //     latest (keyed by member id) for a live leaderboard;
 //   • a `broadcast()` escape hatch + `onGameMessage` for anything game-specific (e.g. a
@@ -52,6 +56,7 @@ type ProtocolMessage<TStart, TProgress, TMeta> =
   | { t: 'party:start'; payload: TStart; members: PartyMember<TMeta>[] }
   | { t: 'party:progress'; id: string; progress: TProgress }
   | { t: 'party:leave'; id: string }
+  | { t: 'party:lobby'; members: PartyMember<TMeta>[] }
   | { t: 'party:closed'; id: string; reason: 'in-progress' | 'room-full' };
 
 export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
@@ -78,6 +83,10 @@ export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
   start: (payload: TStart) => void;
   /** The started match (the opaque payload + the frozen roster), or null in the lobby. */
   match: { payload: TStart; members: PartyMember<TMeta>[] } | null;
+  /** Host only: end the match and put everyone back in THIS same lobby. The room, its share
+   *  code, the socket and the roster all survive, so a party can play game after game without
+   *  anyone re-joining — and the room re-opens to newcomers. No-op for a guest. */
+  endMatch: () => void;
 
   /** Broadcast this device's latest progress (for the live leaderboard). */
   reportProgress: (progress: TProgress) => void;
@@ -128,9 +137,11 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
   // This device's roster id, mirrored into a ref so a transport callback can match a targeted
   // `party:closed` against it without re-subscribing.
   const selfIdRef = useRef<string | null>(null);
-  // Host: flips true once `start()` freezes the roster. A `party:hello` after this is a
-  // latecomer the host turns away — seating them would add a ghost that never receives the
-  // one-shot `party:start` and hangs on the lobby forever.
+  // Host: true WHILE a match is running. A `party:hello` in that window is a latecomer the host
+  // turns away — seating them would add a ghost that never receives the one-shot `party:start`
+  // and hangs on the lobby forever. `endMatch()` clears it again: the seal lasts one match, not
+  // the life of the room, which is what lets a persistent lobby re-admit a friend whose phone
+  // dropped out mid-game.
   const startedRef = useRef(false);
   // Host only: maps a guest's TRANSPORT-level peer id (from `handleProtocol`'s `from`, i.e.
   // what a `peer-leave` will later report) → the roster id they registered under in their
@@ -190,6 +201,17 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
             setMatch({ payload: msg.payload, members: msg.members });
             setMembers(msg.members);
             setPhase('match');
+          }
+          break;
+        case 'party:lobby':
+          // The host finished that game and is back in the lobby choosing the next one. Mirror
+          // it — the room, the share code and this socket all stay exactly as they are, which is
+          // the whole point: nobody re-enters a code between games.
+          if (role === 'guest') {
+            setMembers(msg.members);
+            setMatch(null);
+            setPhase('lobby');
+            setProgress({});
           }
           break;
         case 'party:leave':
@@ -318,6 +340,22 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
     [rawSend],
   );
 
+  // The counterpart to `start()`: everything start froze is released here — the seal on new
+  // joiners, the match payload, and last game's scores (leaving those behind would open the next
+  // game's leaderboard with stale numbers). The transport, the share code and the roster are
+  // deliberately untouched. Guests follow via `party:lobby`; the LIVE roster rides along with it
+  // because `party:start` overwrote each guest's `members` with the frozen copy.
+  const endMatch = useCallback(() => {
+    if (roleRef.current !== 'host') return;
+    startedRef.current = false;
+    const live = rosterRef.current;
+    rawSend({ t: 'party:lobby', members: live } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+    setMembers(live);
+    setMatch(null);
+    setPhase('lobby');
+    setProgress({});
+  }, [rawSend]);
+
   const reportProgress = useCallback(
     (p: TProgress) => {
       const id = roleRef.current === 'host' ? HOST_ID : selfId;
@@ -352,7 +390,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
     };
   }, []);
 
-  return { status, code, error, isHost, selfId, members, phase, host, join, leave, start, match, reportProgress, progress, broadcast };
+  return { status, code, error, isHost, selfId, members, phase, host, join, leave, start, match, endMatch, reportProgress, progress, broadcast };
 }
 
 /** Return a copy of `obj` without `key` — used to drop a departed player's progress. */
