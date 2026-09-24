@@ -334,3 +334,46 @@ describe('useParty — guest', () => {
     expect(party().progress).toEqual({});
   });
 });
+
+// ── leave() forgets the room code (2026-09-24) ───────────────────────────────────────────────
+
+describe('useParty — leave() ends the session, code and all', () => {
+  it('host: the old code is gone after leave(), and never shown while the next room opens', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } });
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'OLD1', selfId: 'h1' });
+    expect(party().code).toBe('OLD1');
+
+    fake.fire({ type: 'error', reason: 'connection-lost' }); // the link drops…
+    act(() => party().leave()); // …and the player taps "Try again"
+    expect(party().code).toBeNull();
+    expect(party().selfId).toBeNull();
+
+    act(() => party().host());
+    expect(party().status).toBe('connecting');
+    expect(party().code).toBeNull(); // not the dead room's code
+    fake.fire({ type: 'hosting', code: 'NEW2', selfId: 'h2' });
+    expect(party().code).toBe('NEW2');
+  });
+
+  it('host(): even without leave(), a new room never shows the previous code', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } });
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'OLD1', selfId: 'h1' });
+    act(() => party().host());
+    expect(party().code).toBeNull();
+  });
+
+  it('guest: leave() clears the code and this device’s id', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    act(() => party().leave());
+    expect(party().code).toBeNull();
+    expect(party().selfId).toBeNull();
+    expect(party().status).toBe('closed');
+  });
+});

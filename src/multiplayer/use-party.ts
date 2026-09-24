@@ -61,7 +61,8 @@ type ProtocolMessage<TStart, TProgress, TMeta> =
 
 export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
   status: MultiplayerStatus;
-  /** The room share code (host: minted; guest: the one entered). Null until known. */
+  /** The room share code (host: minted; guest: the one entered). Null until known, and null
+   *  again once the session ends (`leave()`) or a new one begins (`host()`/`join()`). */
   code: string | null;
   /** A short reason when `status === 'error'` (`no-room`, `room-full`, `host-left`, …). */
   error: string | null;
@@ -311,6 +312,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
 
   const host = useCallback(() => {
     setError(null);
+    setCode(null); // a new room gets a new code — never show the last one while this one opens
     roleRef.current = 'host';
     setIsHost(true);
     setStatus('connecting');
@@ -320,6 +322,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
   const join = useCallback(
     (joinCode: string) => {
       setError(null);
+      setCode(null);
       roleRef.current = 'guest';
       setIsHost(false);
       setStatus('connecting');
@@ -381,6 +384,11 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
     setMatch(null);
     setMembers([]);
     setProgress({});
+    // The session is over, and its share code with it. Keeping it meant a host who tapped "Try
+    // again" after a drop saw — and could share — the dead room's code while the new room was
+    // still being made.
+    setCode(null);
+    setSelfId(null);
   }, []);
 
   useEffect(() => {
