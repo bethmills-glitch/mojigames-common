@@ -48,8 +48,9 @@ export interface OnlineTransportOptions {
 /** The OPEN ready-state value — identical (`1`) across every WebSocket implementation. */
 const WS_OPEN = 1;
 
-/** Heartbeat ping cadence. The relay drops a pinging client after 45 s of silence, so 15 s
- *  leaves room for two lost or late pings before a live client could be mistaken for a dead one. */
+/** Heartbeat ping cadence. The relay drops a pinging client after 150 s of silence (a phone that
+ *  slept or an app left in the background that long), so a live client can lose several pings in a
+ *  row and never be mistaken for a dead one. */
 const DEFAULT_PING_INTERVAL_MS = 15_000;
 
 /** Silence (no message at all — pongs count) after which the link is declared dead. Two and a

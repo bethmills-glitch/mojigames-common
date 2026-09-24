@@ -27,11 +27,14 @@ const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT) || 8787;
 const HEARTBEAT_MS = 30_000; // terminate a socket that misses a ping/pong cycle
-// Drop a socket that has been sending app-level pings and then goes quiet for this long. The
-// client pings every 15 s, so 45 s is three missed pings. Env-tunable so a test can use ~1 s,
-// and so it can be raised on Render without a code change if it proves too eager (see the
-// heartbeat section for what "too eager" would look like).
-const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS) || 45_000;
+// Drop a socket that has been sending app-level pings and then goes quiet for this long.
+// 150 s, not the 45 s (three missed 15 s pings) this was written with: Android pauses an app's
+// timers as soon as it leaves the screen — even for the share sheet — so a host who pops into
+// WhatsApp to send the room code stops pinging, and 45 s would have closed the room under them
+// (2026-09-24 review). Two and a half minutes covers sending a link; a phone that has really gone
+// to sleep is still noticed, just later — which beats the old "never". Env-tunable so a test can
+// use ~1 s, and so it can be changed on Render without a code change.
+const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS) || 150_000;
 // How often to look for silent sockets — frequent enough that a drop lands within a few
 // seconds of the limit, and never so rarely that a short test timeout overshoots badly.
 const SILENCE_SWEEP_MS = Math.max(50, Math.min(5_000, Math.floor(HEARTBEAT_TIMEOUT_MS / 3)));
@@ -279,7 +282,7 @@ wss.on('close', () => clearInterval(heartbeat));
 //
 // Sockets that have never pinged are left strictly alone. That is every client built before this
 // change (HitMoji on Google Play, Mojino build 4, Mojiventure), and they must behave exactly as
-// they always have — they would be dropped after 45 s of an ordinary quiet lobby otherwise.
+// they always have — they would be dropped after HEARTBEAT_TIMEOUT_MS of an ordinary quiet lobby otherwise.
 //
 // The cost, for the record: the rule cannot tell "asleep" from "in another app for a minute". A
 // host who leaves the app for longer than the limit — e.g. to send the code in WhatsApp — loses

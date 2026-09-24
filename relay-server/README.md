@@ -78,7 +78,7 @@ Two independent liveness rules run side by side:
   on the live relay it never drops anyone.
 - **App-level ping** (added 2026-09-24): `OnlineTransport` sends `{type:"ping"}` every 15 s
   while connected. Once a connection has sent one, going silent — no message of any kind — for
-  `HEARTBEAT_TIMEOUT_MS` (45 s) gets it dropped, and its room is told with the usual
+  `HEARTBEAT_TIMEOUT_MS` (150 s) gets it dropped, and its room is told with the usual
   `peer-leave`. That is how a player whose phone went to sleep, or whose app was put in the
   background (React Native pauses JS timers there), is noticed — so a room doesn't hang
   forever on a host or a turn that will never come. Connections that have **never** pinged
