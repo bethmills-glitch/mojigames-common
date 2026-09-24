@@ -1,8 +1,10 @@
 // Smoke test for the relay server. Start the server first (npm start), then in another
 // shell run `npm run smoke-test`. It exercises the whole protocol — host, join, relay
-// both directions, the room-full and unknown-code errors, peer-leave, and a room closing when
-// its host leaves — against a running server, and exits non-zero if any check fails. It doubles
-// as a worked example of the wire protocol for the client (packages/multiplayer).
+// both directions, ping/pong, the room-full and unknown-code errors, peer-leave, and a room
+// closing when its host leaves — against a running server, and exits non-zero if any check
+// fails. It doubles as a worked example of the wire protocol for the client (packages/multiplayer).
+// The timing rules (dropping a client that stops pinging) are covered by reliability-test.js,
+// which starts its own relay with a short limit.
 
 const WebSocket = require('ws');
 
@@ -59,8 +61,11 @@ function connect() {
 }
 
 (async () => {
-  // Host creates a room.
+  // Host creates a room — heartbeating first, as OnlineTransport does.
   const host = await connect();
+  host.send({ type: 'ping' });
+  const pong = await host.next();
+  check('an app-level ping is answered with pong', pong.type === 'pong');
   host.send({ type: 'host', size: 2 });
   const hosted = await host.next();
   check(

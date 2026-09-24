@@ -76,7 +76,8 @@ describe('OnlineTransport — host', () => {
     transport.host({ size: 4 });
     expect(sockets).toHaveLength(1);
     sockets[0].open();
-    expect(sockets[0].sent).toEqual([{ type: 'host', size: 4 }]);
+    // The request, then the heartbeat's first ping (see the heartbeat tests below).
+    expect(sockets[0].sent).toEqual([{ type: 'host', size: 4 }, { type: 'ping' }]);
 
     sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'host' });
     const hosting = eventsOfType(events, 'hosting');
@@ -92,7 +93,7 @@ describe('OnlineTransport — join', () => {
 
     transport.join(' wxyz ');
     sockets[0].open();
-    expect(sockets[0].sent).toEqual([{ type: 'join', code: 'WXYZ' }]);
+    expect(sockets[0].sent).toEqual([{ type: 'join', code: 'WXYZ' }, { type: 'ping' }]);
 
     sockets[0].receive({ type: 'joined', code: 'WXYZ', peerId: 'guest-1', peers: ['host'] });
     expect(eventsOfType(events, 'joined')).toEqual([
@@ -239,5 +240,176 @@ describe('OnlineTransport — connect timeout', () => {
 
     await new Promise<void>((resolve) => setTimeout(resolve, 40));
     expect(eventsOfType(events, 'error')).toHaveLength(0); // no stray timeout after a clean close
+  });
+});
+
+// ── app-level heartbeat ──────────────────────────────────────────────────────────────────
+// The live relay's WebSocket-level ping never reaches a client (Render/Cloudflare swallow it),
+// so a phone that went to sleep was never dropped and its room hung forever. The transport now
+// pings the relay itself and watches for silence. Fake timers: these cover minutes of wall time.
+
+const pings = (socket: FakeSocket) => socket.sent.filter((m) => (m as { type?: string }).type === 'ping').length;
+
+describe('OnlineTransport — heartbeat', () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it('pings as soon as the socket opens, then every 15 s', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    transport.host();
+    expect(pings(sockets[0] ?? new FakeSocket(''))).toBe(0); // nothing before the socket is open
+    sockets[0].open();
+    sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'host' });
+    // The first ping goes with the request: it is what makes the relay police this socket.
+    expect(pings(sockets[0])).toBe(1);
+
+    jest.advanceTimersByTime(14_999);
+    expect(pings(sockets[0])).toBe(1);
+    jest.advanceTimersByTime(1);
+    expect(pings(sockets[0])).toBe(2);
+    sockets[0].receive({ type: 'pong' });
+    jest.advanceTimersByTime(15_000);
+    expect(pings(sockets[0])).toBe(3);
+    transport.close();
+  });
+
+  it('keeps a link alive for as long as the relay keeps answering', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    const events = collect(transport);
+    transport.host();
+    sockets[0].open();
+    sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'host' });
+
+    for (let i = 0; i < 20; i++) { // five minutes of a quiet lobby
+      jest.advanceTimersByTime(15_000);
+      sockets[0].receive({ type: 'pong' });
+    }
+    expect(eventsOfType(events, 'error')).toHaveLength(0);
+    expect(sockets[0].closed).toBe(false);
+    transport.close();
+  });
+
+  it('declares a link dead after 40 s of silence, reports it like any drop, and stops pinging', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    const events = collect(transport);
+    transport.host();
+    sockets[0].open();
+    sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'host' });
+
+    jest.advanceTimersByTime(40_000); // exactly at the limit — not yet
+    expect(eventsOfType(events, 'error')).toHaveLength(0);
+    jest.advanceTimersByTime(5_000); // the next check
+    // The same two events an unexpected close produces, so the app's existing handling runs.
+    expect(eventsOfType(events, 'error')).toEqual([{ type: 'error', reason: 'connection-lost' }]);
+    expect(eventsOfType(events, 'closed')).toHaveLength(1);
+    expect(sockets[0].closed).toBe(true);
+
+    const sentBefore = pings(sockets[0]);
+    jest.advanceTimersByTime(60_000);
+    expect(pings(sockets[0])).toBe(sentBefore); // the heartbeat died with the link
+    expect(eventsOfType(events, 'error')).toHaveLength(1); // and nothing more is reported
+  });
+
+  it('does not count its own suspension (app backgrounded, phone asleep) as relay silence', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    const events = collect(transport);
+    transport.host();
+    sockets[0].open();
+    sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'host' });
+    const before = pings(sockets[0]);
+
+    // Two minutes pass with no timer running at all (React Native pauses JS timers in the
+    // background); then the overdue check fires once, on resume.
+    jest.setSystemTime(Date.now() + 120_000);
+    jest.advanceTimersByTime(5_000);
+    expect(eventsOfType(events, 'error')).toHaveLength(0); // not blamed on the relay
+    expect(pings(sockets[0])).toBe(before + 1); // a ping at once, to find out if the link survived
+
+    // If nothing answers that, the link really is gone — reported within the normal window.
+    jest.advanceTimersByTime(45_000);
+    expect(eventsOfType(events, 'error')).toEqual([{ type: 'error', reason: 'connection-lost' }]);
+  });
+
+  it('close() stops the heartbeat', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    const events = collect(transport);
+    transport.host();
+    sockets[0].open();
+    transport.close();
+
+    jest.advanceTimersByTime(120_000);
+    expect(pings(sockets[0])).toBe(1); // just the first one
+    expect(eventsOfType(events, 'error')).toHaveLength(0);
+  });
+
+  it('honours custom ping/dead timings', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor, pingIntervalMs: 100, deadAfterMs: 400 });
+    const events = collect(transport);
+    transport.join('ABCD');
+    sockets[0].open();
+    jest.advanceTimersByTime(300);
+    expect(pings(sockets[0])).toBe(4); // t = 0, 100, 200, 300
+    jest.advanceTimersByTime(200);
+    expect(eventsOfType(events, 'error')).toEqual([{ type: 'error', reason: 'connection-lost' }]);
+  });
+});
+
+// ── a socket we let go of stays let go of ─────────────────────────────────────────────────
+// A real WebSocket reports its close LATER. Before, a socket abandoned by the connect timeout
+// could fire that late close after a retry had opened a new one — clearing the retry's timer,
+// nulling its socket, and reporting connection-lost on a link that was fine.
+
+describe('OnlineTransport — abandoned sockets', () => {
+  it('a late close from a socket dropped by the connect timeout does not touch the retry', () => {
+    jest.useFakeTimers();
+    try {
+      const { Ctor, sockets } = fakeWebSocketCtor();
+      const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor, connectTimeoutMs: 20 });
+      const events = collect(transport);
+
+      transport.join('AAAA');
+      const stalled = sockets[0];
+      const lateClose = stalled.onclose; // what a real socket would call later
+      jest.advanceTimersByTime(20);
+      expect(eventsOfType(events, 'error')).toEqual([{ type: 'error', reason: 'timeout' }]);
+
+      transport.join('AAAA'); // the player taps "try again"
+      expect(sockets).toHaveLength(2);
+      lateClose?.(); // …and only now does the stalled socket's close arrive
+      expect(eventsOfType(events, 'error')).toHaveLength(1); // no spurious connection-lost
+
+      sockets[1].open();
+      expect(sockets[1].sent[0]).toEqual({ type: 'join', code: 'AAAA' }); // the retry's socket is intact
+      // …and so is the retry's own connect timer: left unanswered, it still fires.
+      jest.advanceTimersByTime(20);
+      expect(eventsOfType(events, 'error')).toEqual([
+        { type: 'error', reason: 'timeout' },
+        { type: 'error', reason: 'timeout' },
+      ]);
+      transport.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a socket closed before it opened never starts a heartbeat', () => {
+    jest.useFakeTimers();
+    try {
+      const { Ctor, sockets } = fakeWebSocketCtor();
+      const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+      transport.host();
+      transport.close();
+      sockets[0].open(); // a late open event
+      jest.advanceTimersByTime(60_000);
+      expect(sockets[0].sent).toEqual([]);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

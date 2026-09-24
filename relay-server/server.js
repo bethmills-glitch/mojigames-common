@@ -10,12 +10,16 @@
 //   client → server : {type:'host', size?}  {type:'join', code}  {type:'msg', data}  {type:'ping'}
 //   server → client : {type:'hosted'|'joined'|'peer-join'|'peer-leave'|'msg'|'error'|'pong'}
 //
-// A room CLOSES when its host (the socket that created it) disconnects. The guests still in it
-// are told exactly as before (`peer-leave`), but the code stops working: a later `join` gets
-// `no-room`, instead of a seat in a room nobody will ever start.
+// Two rules keep a room from hanging on someone who is no longer there:
+//   • A room CLOSES when its host (the socket that created it) disconnects. The guests still in
+//     it are told exactly as before (`peer-leave`), but the code stops working: a later `join`
+//     gets `no-room`, instead of a seat in a room nobody will ever start.
+//   • A client that sends app-level `{type:'ping'}`s is policed for silence — see the heartbeat
+//     section at the bottom. Clients that never ping (every build before 2026-09-24) are not.
 //
 // Run:    node server.js        (listens on $PORT, default 8787)
 // Verify: node smoke-test.js    (with the server running)
+//         node reliability-test.js   (starts its own relay with short timeouts)
 
 const http = require('http');
 const crypto = require('crypto');
@@ -23,6 +27,14 @@ const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT) || 8787;
 const HEARTBEAT_MS = 30_000; // terminate a socket that misses a ping/pong cycle
+// Drop a socket that has been sending app-level pings and then goes quiet for this long. The
+// client pings every 15 s, so 45 s is three missed pings. Env-tunable so a test can use ~1 s,
+// and so it can be raised on Render without a code change if it proves too eager (see the
+// heartbeat section for what "too eager" would look like).
+const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS) || 45_000;
+// How often to look for silent sockets — frequent enough that a drop lands within a few
+// seconds of the limit, and never so rarely that a short test timeout overshoots badly.
+const SILENCE_SWEEP_MS = Math.max(50, Math.min(5_000, Math.floor(HEARTBEAT_TIMEOUT_MS / 3)));
 const DEFAULT_ROOM_SIZE = 2; // a Versus match; a host may request 2..MAX_ROOM_SIZE
 const MAX_ROOM_SIZE = 8;
 const CODE_LENGTH = 4;
@@ -194,11 +206,17 @@ wss.on('connection', (ws, req) => {
   ws.roomCode = null;
   ws.failedJoins = 0;
   ws.isAlive = true;
+  // App-level heartbeat bookkeeping (see the heartbeat section below): when this client last
+  // sent us anything at all, and whether it has ever sent an app-level ping.
+  ws.lastHeardAt = Date.now();
+  ws.sendsPings = false;
   ws.on('pong', () => {
     ws.isAlive = true;
   });
 
   ws.on('message', (raw) => {
+    // Any frame at all proves the client's app is running — even one we can't parse.
+    ws.lastHeardAt = Date.now();
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -217,6 +235,7 @@ wss.on('connection', (ws, req) => {
         handleMsg(ws, msg);
         break;
       case 'ping':
+        ws.sendsPings = true; // from now on this socket is policed for silence
         send(ws, { type: 'pong' });
         break;
       default:
@@ -230,6 +249,14 @@ wss.on('connection', (ws, req) => {
 });
 
 // Heartbeat — a dead connection that never closes cleanly would otherwise leak its room.
+//
+// ⚠️ On the live deployment this protocol-level ping does NOT work, and nothing here can tell.
+// Something in front of Render (it answers as Cloudflare) swallows the ping frames before they
+// reach the client — and, since no socket is ever dropped, evidently answers them too (measured
+// 2026-09-24: two idle sockets received 0 pings in 15 minutes, and a frozen client was never
+// dropped in 180 s, where a local relay dropped it in ~59 s).
+// It is kept because it still works wherever the relay is reached directly (local dev, a plain
+// VPS), and old clients rely on nothing else. The app-level heartbeat below is what works on Render.
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws.isAlive) {
@@ -241,6 +268,34 @@ const heartbeat = setInterval(() => {
   }
 }, HEARTBEAT_MS);
 wss.on('close', () => clearInterval(heartbeat));
+
+// App-level heartbeat. A client that sends `{type:'ping'}` (OnlineTransport does, every 15 s
+// while its socket is open, since 2026-09-24) is promising to keep talking; once it has pinged
+// even once, HEARTBEAT_TIMEOUT_MS of total silence means its app is no longer running — the phone
+// went to sleep, the app was backgrounded (React Native pauses JS timers there), or the network
+// silently vanished. Terminate it so the rest of the room gets the usual `peer-leave`: without
+// this, a host whose phone slept left every guest waiting forever, and a turn-based game hung on
+// the missing player's turn.
+//
+// Sockets that have never pinged are left strictly alone. That is every client built before this
+// change (HitMoji on Google Play, Mojino build 4, Mojiventure), and they must behave exactly as
+// they always have — they would be dropped after 45 s of an ordinary quiet lobby otherwise.
+//
+// The cost, for the record: the rule cannot tell "asleep" from "in another app for a minute". A
+// host who leaves the app for longer than the limit — e.g. to send the code in WhatsApp — loses
+// the room, and their guests are told the host left. Raise HEARTBEAT_TIMEOUT_MS if that bites.
+// A bonus: those 15 s pings are inbound traffic, so Render's free instance no longer falls
+// asleep under an open room.
+const silenceSweep = setInterval(() => {
+  const now = Date.now();
+  for (const ws of wss.clients) {
+    if (ws.sendsPings && now - ws.lastHeardAt > HEARTBEAT_TIMEOUT_MS) {
+      leaveRoom(ws); // tell the room now; the `close` event's own leaveRoom is then a no-op
+      ws.terminate();
+    }
+  }
+}, SILENCE_SWEEP_MS);
+wss.on('close', () => clearInterval(silenceSweep));
 
 // Forget IPs that have gone quiet, so this map doesn't grow forever.
 const rateLimitSweep = setInterval(() => {
