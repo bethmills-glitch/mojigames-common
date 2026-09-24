@@ -14,6 +14,7 @@ function createFakeTransport() {
   const sent: unknown[] = [];
   let hostSize: number | undefined;
   let joinedCode: string | undefined;
+  let closeCount = 0;
   const transport: Transport = {
     host: (o) => {
       hostSize = o?.size;
@@ -24,7 +25,11 @@ function createFakeTransport() {
     send: (d) => {
       sent.push(d);
     },
-    close: () => {},
+    // Like the real transports: closing reports `closed` to the listeners.
+    close: () => {
+      closeCount += 1;
+      listeners.forEach((l) => l({ type: 'closed' }));
+    },
     subscribe: (l) => {
       listeners.add(l);
       return () => listeners.delete(l);
@@ -40,22 +45,42 @@ function createFakeTransport() {
     get joinedCode() {
       return joinedCode;
     },
+    /** How many times the hook hung up this transport. */
+    get closeCount() {
+      return closeCount;
+    },
   };
 }
 
 type Meta = { avatar: string };
-function renderParty(fake: ReturnType<typeof createFakeTransport>, self: { name: string; meta: Meta }, maxPlayers?: number) {
-  let api!: Party<{ items: number[] }, { score: number }, Meta>;
+type TestParty = Party<{ items: number[] }, { score: number }, Meta>;
+
+// Every rendered probe is unmounted after its test, so no guest's hello timer outlives it.
+const mounted: TestRenderer.ReactTestRenderer[] = [];
+afterEach(() => {
+  act(() => {
+    for (const r of mounted.splice(0)) r.unmount();
+  });
+});
+
+function renderParty(
+  fake: ReturnType<typeof createFakeTransport>,
+  self: { name: string; meta: Meta },
+  maxPlayers?: number,
+  extra?: { hostReplyTimeoutMs?: number; createTransport?: () => Transport },
+) {
+  let api!: TestParty;
   function Probe() {
     api = useParty<{ items: number[] }, { score: number }, Meta>({
-      createTransport: () => fake.transport,
+      createTransport: extra?.createTransport ?? (() => fake.transport),
       self,
       maxPlayers,
+      hostReplyTimeoutMs: extra?.hostReplyTimeoutMs,
     });
     return null;
   }
   act(() => {
-    TestRenderer.create(React.createElement(Probe));
+    mounted.push(TestRenderer.create(React.createElement(Probe)));
   });
   return () => api;
 }
@@ -216,7 +241,10 @@ describe('useParty — host', () => {
 
     act(() => party().join('WXYZ'));
     fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
-    const roster = [{ id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } }];
+    const roster = [
+      { id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } },
+      { id: 'g1', name: 'Bo', meta: { avatar: '🐼' } },
+    ];
     fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [1] }, members: roster } });
     expect(party().phase).toBe('match');
 
@@ -335,7 +363,118 @@ describe('useParty — guest', () => {
   });
 });
 
-// ── leave() forgets the room code (2026-09-24) ───────────────────────────────────────────────
+// ── 2026-09-24 reliability fixes ─────────────────────────────────────────────────────────────
+
+const countSent = (sent: unknown[], kind: string) => sent.filter((m) => (m as { t?: string }).t === kind).length;
+const ANN = { id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } };
+const BO = { id: 'g1', name: 'Bo', meta: { avatar: '🐼' } };
+const CY = { id: 'late', name: 'Cy', meta: { avatar: '🐧' } };
+
+describe('useParty — when the host leaves (guest)', () => {
+  it('hangs up, so the dead room is not kept alive — and a retry builds a fresh transport', () => {
+    const fake = createFakeTransport();
+    let built = 0;
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } }, undefined, {
+      createTransport: () => {
+        built += 1;
+        return fake.transport;
+      },
+    });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: [ANN, BO] } });
+
+    fake.fire({ type: 'peer-leave', peerId: 'h1' });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('host-left');
+    expect(party().waitingForHost).toBe(false);
+    expect(fake.closeCount).toBe(1); // hung up
+
+    act(() => party().join('WXYZ')); // "Try again" without leave() still gets a new connection
+    expect(built).toBe(2);
+  });
+
+  it('does not hang up when another guest leaves', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1', 'g2'] });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: [ANN, BO] } });
+    fake.fire({ type: 'peer-leave', peerId: 'g2' });
+    expect(party().status).toBe('connected');
+    expect(fake.closeCount).toBe(0);
+  });
+});
+
+describe('useParty — a join that no host answers (guest)', () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it('reports a room with nobody in it at once, and hangs up', () => {
+    // A relay from before 2026-09-24 let you into a room its host had left: "0/6 in the room ·
+    // waiting for the host to start…" forever.
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: [] });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('no-room');
+    expect(fake.closeCount).toBe(1);
+    expect(countSent(fake.sent, 'party:hello')).toBe(0);
+  });
+
+  it('says the host is not answering after 5 s — and recovers by itself if the host then answers', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1'] });
+
+    act(() => jest.advanceTimersByTime(4_999));
+    expect(party().status).toBe('connected');
+    act(() => jest.advanceTimersByTime(1));
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('host-unresponsive');
+    expect(party().waitingForHost).toBe(true);
+    expect(fake.closeCount).toBe(0); // still connected: the host may just be in another app
+
+    // The host comes back and seats us.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: [ANN, CY] } });
+    expect(party().status).toBe('connected');
+    expect(party().error).toBeNull();
+    expect(party().waitingForHost).toBe(false);
+  });
+
+  it('a prompt answer means no error', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: [ANN, BO] } });
+    act(() => jest.advanceTimersByTime(60_000));
+    expect(party().status).toBe('connected');
+    expect(party().error).toBeNull();
+  });
+
+  it('never overwrites a real error with host-unresponsive', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    fake.fire({ type: 'error', reason: 'connection-lost' });
+    act(() => jest.advanceTimersByTime(60_000));
+    expect(party().error).toBe('connection-lost');
+    expect(party().waitingForHost).toBe(false);
+  });
+
+  it('honours a custom wait', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } }, undefined, { hostReplyTimeoutMs: 100 });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    act(() => jest.advanceTimersByTime(100));
+    expect(party().error).toBe('host-unresponsive');
+  });
+});
 
 describe('useParty — leave() ends the session, code and all', () => {
   it('host: the old code is gone after leave(), and never shown while the next room opens', () => {
@@ -375,5 +514,309 @@ describe('useParty — leave() ends the session, code and all', () => {
     expect(party().code).toBeNull();
     expect(party().selfId).toBeNull();
     expect(party().status).toBe('closed');
+  });
+});
+
+describe('useParty — arriving mid-game: the waitlist (guest)', () => {
+  it('says in its hello that it can wait', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1'] });
+    expect(lastSent(fake.sent, 'party:hello')).toEqual({ t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' }, waitlist: true });
+  });
+
+  it('waits connected, ignores the game it is not in, and is dealt into the next one', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1', 'g1'] });
+
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'in-progress' } });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('match-started'); // what today's screens already explain
+    expect(party().waitingForHost).toBe(true);
+    expect(fake.closeCount).toBe(0); // still in the room
+
+    // The host hits "Play again" with start() — a game this device was NOT dealt into. It used to
+    // walk straight in and sit under a "Connection lost" overlay.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [9] }, members: [ANN, BO] } });
+    expect(party().phase).toBe('lobby');
+    expect(party().match).toBeNull();
+    expect(party().error).toBe('match-started');
+
+    // The host returns everyone to the lobby and seats the waitlist → the wait ends by itself.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:lobby', members: [ANN, BO, CY] } });
+    expect(party().status).toBe('connected');
+    expect(party().error).toBeNull();
+    expect(party().waitingForHost).toBe(false);
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1', 'late']);
+
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [10] }, members: [ANN, BO, CY] } });
+    expect(party().phase).toBe('match');
+    expect(party().match?.payload).toEqual({ items: [10] });
+  });
+
+  it('with a host on an older build (no waitlist), asks again once the room re-opens', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1'] });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'in-progress' } });
+    expect(countSent(fake.sent, 'party:hello')).toBe(1);
+
+    // The older host's lobby doesn't list us (it keeps no waitlist)…
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:lobby', members: [ANN, BO] } });
+    expect(countSent(fake.sent, 'party:hello')).toBe(2); // …so we say hello again
+    expect(party().error).toBe('match-started'); // still waiting until it answers
+
+    // …and in its lobby it seats a hello like any other.
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: [ANN, BO, CY] } });
+    expect(party().status).toBe('connected');
+    expect(party().error).toBeNull();
+  });
+
+  it('turned away because the room is full: hangs up rather than hear a game it is not in', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Cy', meta: { avatar: '🐧' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1'] });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'room-full' } });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('room-full');
+    expect(party().waitingForHost).toBe(false);
+    expect(fake.closeCount).toBe(1);
+  });
+});
+
+describe('useParty — arriving mid-game: the waitlist (host)', () => {
+  function hostMidMatch(maxPlayers = 8) {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } }, maxPlayers);
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    act(() => party().start({ items: [1] }));
+    return { fake, party };
+  }
+
+  it('waitlists a latecomer who can wait, and seats them at endMatch — in the next game', () => {
+    const { fake, party } = hostMidMatch();
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' }, waitlist: true } });
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'late', reason: 'in-progress' });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // not seated mid-game
+    expect(party().waitlist).toEqual([CY]);
+
+    act(() => party().endMatch());
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1', 'late']);
+    expect(lastSent(fake.sent, 'party:lobby')).toMatchObject({ members: [{ id: HOST_ID }, { id: 'g1' }, { id: 'late' }] });
+    expect(party().waitlist).toEqual([]);
+
+    act(() => party().start({ items: [2] }));
+    expect(lastSent(fake.sent, 'party:start')).toMatchObject({ members: [{ id: HOST_ID }, { id: 'g1' }, { id: 'late' }] });
+  });
+
+  it('a guest on an older build (no waitlist flag) is turned away exactly as before', () => {
+    const { fake, party } = hostMidMatch();
+    fake.fire({ type: 'message', from: 'old', data: { t: 'party:hello', id: 'old', name: 'Di', meta: { avatar: '🐨' } } });
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'old', reason: 'in-progress' });
+    expect(party().waitlist).toEqual([]);
+    act(() => party().endMatch());
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // its screen could not recover
+  });
+
+  it('a waitlisted player who gives up is taken off the list', () => {
+    const { fake, party } = hostMidMatch();
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' }, waitlist: true } });
+    fake.fire({ type: 'peer-leave', peerId: 'late' });
+    expect(party().waitlist).toEqual([]);
+    act(() => party().endMatch());
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']);
+  });
+
+  it('nextMatch: "Play again" straight from a match deals the waitlist in', () => {
+    const { fake, party } = hostMidMatch();
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' }, waitlist: true } });
+
+    // The payload is built from the roster AFTER the latecomer is seated — a game that deals
+    // one hand per player deals them one.
+    act(() => party().nextMatch((roster) => ({ items: roster.map((_, i) => i) })));
+    expect(party().phase).toBe('match');
+    expect(party().match?.payload).toEqual({ items: [0, 1, 2] });
+    expect(party().match?.members.map((m) => m.id)).toEqual([HOST_ID, 'g1', 'late']);
+    expect(lastSent(fake.sent, 'party:start')).toMatchObject({ members: [{ id: HOST_ID }, { id: 'g1' }, { id: 'late' }] });
+    expect(party().waitlist).toEqual([]);
+
+    // …and the room stays sealed for this new game.
+    fake.fire({ type: 'message', from: 'later', data: { t: 'party:hello', id: 'later', name: 'Ed', meta: { avatar: '🐯' } } });
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'later', reason: 'in-progress' });
+  });
+
+  it('nextMatch with nobody waiting is just a start', () => {
+    const { fake, party } = hostMidMatch();
+    const rostersBefore = countSent(fake.sent, 'party:roster');
+    act(() => party().nextMatch((roster) => ({ items: [roster.length] })));
+    expect(party().match?.payload).toEqual({ items: [2] });
+    expect(countSent(fake.sent, 'party:roster')).toBe(rostersBefore); // no needless roster broadcast
+  });
+
+  it('ignores nextMatch from a guest', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZ'));
+    fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'g1', peers: ['h1'] });
+    act(() => party().nextMatch(() => ({ items: [1] })));
+    expect(lastSent(fake.sent, 'party:start')).toBeUndefined();
+  });
+
+  it('tells a waitlisted player the room is full if the seats ran out', () => {
+    const { fake, party } = hostMidMatch(2); // host + 1: full
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' }, waitlist: true } });
+    act(() => party().endMatch());
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']);
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'late', reason: 'room-full' });
+  });
+
+  it('answers a duplicate hello by sending the roster again', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } });
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZ', selfId: 'h1' });
+    const hello = { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } };
+    fake.fire({ type: 'message', from: 'g1', data: hello });
+    const rosters = countSent(fake.sent, 'party:roster');
+    fake.fire({ type: 'message', from: 'g1', data: hello });
+    expect(countSent(fake.sent, 'party:roster')).toBe(rosters + 1);
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // not seated twice
+  });
+});
+
+// ── Host and guests together, over an in-memory relay ─────────────────────────────────────────
+// The unit tests above fire hand-written messages; these wire real hooks to each other through a
+// tiny synchronous relay (same semantics as relay-server/server.js: host/join/broadcast, and a
+// room that closes when its host leaves), so the two halves of each fix are tested as a pair.
+
+function createMemoryRelay() {
+  let seq = 0;
+  let hostId: string | null = null;
+  let open = false;
+  const room = new Map<string, (e: TransportEvent) => void>();
+  const transports: string[] = [];
+  function transport(): Transport {
+    const id = `peer${++seq}`;
+    transports.push(id);
+    const listeners = new Set<TransportListener>();
+    const emit = (e: TransportEvent) => listeners.forEach((l) => l(e));
+    let inRoom = false;
+    return {
+      host: () => {
+        hostId = id;
+        open = true;
+        inRoom = true;
+        room.set(id, emit);
+        emit({ type: 'hosting', code: 'ROOM', selfId: id });
+      },
+      join: () => {
+        if (!open) {
+          emit({ type: 'error', reason: 'no-room' });
+          return;
+        }
+        const peers = [...room.keys()];
+        inRoom = true;
+        room.set(id, emit);
+        emit({ type: 'joined', code: 'ROOM', selfId: id, peers });
+        for (const [pid, other] of room) if (pid !== id) other({ type: 'peer-join', peerId: id });
+      },
+      send: (data) => {
+        if (!inRoom) return;
+        for (const [pid, other] of room) if (pid !== id) other({ type: 'message', from: id, data });
+      },
+      close: () => {
+        if (inRoom) {
+          inRoom = false;
+          room.delete(id);
+          if (id === hostId) open = false;
+          for (const other of room.values()) other({ type: 'peer-leave', peerId: id });
+        }
+        emit({ type: 'closed' });
+      },
+      subscribe: (l) => {
+        listeners.add(l);
+        return () => listeners.delete(l);
+      },
+    };
+  }
+  return { transport, inRoom: () => room.size };
+}
+
+function renderOn(relay: ReturnType<typeof createMemoryRelay>, name: string) {
+  const dummy = createFakeTransport(); // unused: createTransport below builds relay transports
+  return renderParty(dummy, { name, meta: { avatar: name } }, 8, { createTransport: relay.transport });
+}
+
+describe('useParty — host and guests together', () => {
+  it('a friend who arrives mid-game waits, then is dealt into the next game', () => {
+    const relay = createMemoryRelay();
+    const ann = renderOn(relay, 'Ann');
+    const bo = renderOn(relay, 'Bo');
+    const cy = renderOn(relay, 'Cy');
+
+    act(() => ann().host());
+    act(() => bo().join('ROOM'));
+    expect(ann().members.map((m) => m.name)).toEqual(['Ann', 'Bo']);
+    act(() => ann().start({ items: [1] }));
+    expect(bo().phase).toBe('match');
+
+    act(() => cy().join('ROOM')); // mid-game
+    expect(cy().error).toBe('match-started');
+    expect(cy().waitingForHost).toBe(true);
+    expect(ann().waitlist.map((m) => m.name)).toEqual(['Cy']);
+
+    act(() => ann().endMatch());
+    expect(cy().status).toBe('connected');
+    expect(cy().error).toBeNull();
+    act(() => ann().start({ items: [2] }));
+    expect(cy().phase).toBe('match');
+    expect(cy().match?.members.map((m) => m.name)).toEqual(['Ann', 'Bo', 'Cy']);
+    expect(bo().match?.members.map((m) => m.name)).toEqual(['Ann', 'Bo', 'Cy']);
+  });
+
+  it('…and with "Play again" straight from the match (nextMatch)', () => {
+    const relay = createMemoryRelay();
+    const ann = renderOn(relay, 'Ann');
+    const bo = renderOn(relay, 'Bo');
+    const cy = renderOn(relay, 'Cy');
+    act(() => ann().host());
+    act(() => bo().join('ROOM'));
+    act(() => ann().start({ items: [1] }));
+    act(() => cy().join('ROOM'));
+
+    // A plain second start() can't include Cy (the payload predates her seat): she stays put
+    // and waiting instead of walking into a game she has no part in.
+    act(() => ann().start({ items: [2] }));
+    expect(cy().phase).toBe('lobby');
+    expect(cy().waitingForHost).toBe(true);
+
+    act(() => ann().nextMatch((roster) => ({ items: roster.map((_, i) => i) })));
+    expect(cy().status).toBe('connected');
+    expect(cy().phase).toBe('match');
+    expect(cy().match?.payload).toEqual({ items: [0, 1, 2] });
+    expect(bo().match?.payload).toEqual({ items: [0, 1, 2] });
+  });
+
+  it('when the host leaves, guests hang up and the code stops working', () => {
+    const relay = createMemoryRelay();
+    const ann = renderOn(relay, 'Ann');
+    const bo = renderOn(relay, 'Bo');
+    const cy = renderOn(relay, 'Cy');
+    act(() => ann().host());
+    act(() => bo().join('ROOM'));
+    act(() => ann().leave());
+
+    expect(bo().error).toBe('host-left');
+    expect(relay.inRoom()).toBe(0); // Bo hung up — no zombie room left behind
+    act(() => cy().join('ROOM'));
+    expect(cy().status).toBe('error');
+    expect(cy().error).toBe('no-room');
   });
 });
