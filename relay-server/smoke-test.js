@@ -1,8 +1,8 @@
 // Smoke test for the relay server. Start the server first (npm start), then in another
 // shell run `npm run smoke-test`. It exercises the whole protocol — host, join, relay
-// both directions, the room-full and unknown-code errors, and peer-leave — against a
-// running server, and exits non-zero if any check fails. It doubles as a worked example
-// of the wire protocol for the client (packages/multiplayer).
+// both directions, the room-full and unknown-code errors, peer-leave, and a room closing when
+// its host leaves — against a running server, and exits non-zero if any check fails. It doubles
+// as a worked example of the wire protocol for the client (packages/multiplayer).
 
 const WebSocket = require('ws');
 
@@ -140,6 +140,31 @@ function connect() {
     peerLeave.type === 'peer-leave' && peerLeave.peerId === joined.peerId,
   );
   host.close();
+
+  // A room closes when its HOST leaves: the guests still in it are told as always, but the
+  // code stops working — a newcomer must not be seated in a room nobody can ever start.
+  const host2 = await connect();
+  host2.send({ type: 'host', size: 3 });
+  const hosted2 = await host2.next();
+  const stranded = await connect();
+  stranded.send({ type: 'join', code: hosted2.code });
+  await stranded.next(); // joined
+  await host2.next(); // peer-join
+  host2.close();
+  const hostGone = await stranded.next();
+  check(
+    'a guest is notified when the host leaves',
+    hostGone.type === 'peer-leave' && hostGone.peerId === hosted2.peerId,
+  );
+  const newcomer = await connect();
+  newcomer.send({ type: 'join', code: hosted2.code });
+  const refused = await newcomer.next();
+  check(
+    'joining a room whose host has left returns a no-room error',
+    refused.type === 'error' && refused.reason === 'no-room',
+  );
+  newcomer.close();
+  stranded.close();
 
   console.log(
     failures === 0

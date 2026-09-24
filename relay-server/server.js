@@ -10,6 +10,10 @@
 //   client → server : {type:'host', size?}  {type:'join', code}  {type:'msg', data}  {type:'ping'}
 //   server → client : {type:'hosted'|'joined'|'peer-join'|'peer-leave'|'msg'|'error'|'pong'}
 //
+// A room CLOSES when its host (the socket that created it) disconnects. The guests still in it
+// are told exactly as before (`peer-leave`), but the code stops working: a later `join` gets
+// `no-room`, instead of a seat in a room nobody will ever start.
+//
 // Run:    node server.js        (listens on $PORT, default 8787)
 // Verify: node smoke-test.js    (with the server running)
 
@@ -26,7 +30,12 @@ const CODE_LENGTH = 4;
 // and typed by hand, so legibility matters more than entropy.
 const CODE_ALPHABET = 'ACDEFGHJKMNPQRSTUVWXYZ23456789';
 
-/** Live rooms — `code` → `{ size, peers: Map<peerId, ws> }`. */
+/**
+ * Live rooms — `code` → `{ size, hostId, open, peers: Map<peerId, ws> }`. `hostId` is the
+ * peerId of the socket that created the room; `open` goes false for good when that socket
+ * leaves (see leaveRoom). A closed room lingers only while stranded guests are still in it,
+ * which also keeps its code from being handed to a new room while they are.
+ */
 const rooms = new Map();
 
 // ── Rate limiting ────────────────────────────────────────────────────────────────────
@@ -94,6 +103,11 @@ function leaveRoom(ws) {
   const room = rooms.get(code);
   if (!room) return;
   room.peers.delete(ws.peerId);
+  // The host is gone, so nothing in this room can ever start again: every game is
+  // host-authoritative. Before this, the room stayed joinable for as long as anyone lingered in
+  // it, and a friend arriving by the same code or share link was seated in a room with no host,
+  // showing "0/6 in the room · waiting for the host to start…" forever.
+  if (ws.peerId === room.hostId) room.open = false;
   if (room.peers.size === 0) {
     rooms.delete(code);
   } else {
@@ -109,7 +123,7 @@ function handleHost(ws, msg) {
     Math.max(2, Number(msg.size) || DEFAULT_ROOM_SIZE),
   );
   const code = makeCode();
-  rooms.set(code, { size, peers: new Map([[ws.peerId, ws]]) });
+  rooms.set(code, { size, hostId: ws.peerId, open: true, peers: new Map([[ws.peerId, ws]]) });
   ws.roomCode = code;
   send(ws, { type: 'hosted', code, peerId: ws.peerId });
 }
@@ -118,10 +132,13 @@ function handleHost(ws, msg) {
 function handleJoin(ws, msg) {
   const code = String(msg.code || '').toUpperCase().trim();
   const room = rooms.get(code);
-  if (!room) {
+  if (!room || !room.open) {
+    // A room whose host has left answers exactly like a missing one: to the player the code is
+    // simply dead, and every client already shows a friendly message for `no-room`.
     // Only a WRONG code counts toward the brute-force limit — a real code that's merely
-    // full (below) means they already had it, which isn't a guessing signal.
-    ws.failedJoins += 1;
+    // full (below) or closed means they already had it, which isn't a guessing signal (someone
+    // retrying a stale share link must not have their connection cut).
+    if (!room) ws.failedJoins += 1;
     send(ws, { type: 'error', reason: 'no-room', code });
     if (ws.failedJoins >= MAX_FAILED_JOINS_PER_CONNECTION) {
       ws.close(1008, 'too many wrong codes');
