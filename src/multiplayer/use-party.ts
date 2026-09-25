@@ -70,7 +70,11 @@ type ProtocolMessage<TStart, TProgress, TMeta> =
   | { t: 'party:progress'; id: string; progress: TProgress }
   | { t: 'party:leave'; id: string }
   | { t: 'party:lobby'; members: PartyMember<TMeta>[] }
-  | { t: 'party:closed'; id: string; reason: 'in-progress' | 'room-full' };
+  // `host` (added 2026-09-24): who turned you away — their name and meta — so a latecomer still
+  // learns what the room is (Mojino tags meta with its game; a Poker screen that lands in a
+  // running Bingo room must say "that code is for Bingo", not "you'll be dealt in next game").
+  // Older guests ignore it.
+  | { t: 'party:closed'; id: string; reason: 'in-progress' | 'room-full'; host?: PartyMember<TMeta> };
 
 export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
   status: MultiplayerStatus;
@@ -296,7 +300,8 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
           // `id` on the far side, so only this joiner reacts.
           if (startedRef.current || cur.length >= maxPlayers) {
             const inProgress = startedRef.current;
-            rawSend({ t: 'party:closed', id: msg.id, reason: inProgress ? 'in-progress' : 'room-full' } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+            const host: PartyMember<TMeta> = { id: HOST_ID, name: optsRef.current.self.name, meta: optsRef.current.self.meta };
+            rawSend({ t: 'party:closed', id: msg.id, reason: inProgress ? 'in-progress' : 'room-full', host } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
             // …but a latecomer who can wait goes on the waitlist, to be seated at endMatch().
             if (inProgress && msg.waitlist === true) {
               benchRef.current.set(from, { id: msg.id, name: msg.name || 'Player', meta: msg.meta });
@@ -366,6 +371,8 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
               // everyone to the lobby. The error is how today's screens already explain this;
               // `waitingForHost` lets a newer screen say "you're in the next game".
               waitingRef.current = 'match-started';
+              // Show who's hosting (and what they're running — see `party:closed`) while we wait.
+              if (msg.host && typeof msg.host === 'object' && msg.host.id === HOST_ID) setMembers([msg.host]);
               setError('match-started');
               setStatus('error');
             }

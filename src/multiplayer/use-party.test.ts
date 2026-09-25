@@ -532,9 +532,10 @@ describe('useParty — arriving mid-game: the waitlist (guest)', () => {
     act(() => party().join('WXYZ'));
     fake.fire({ type: 'joined', code: 'WXYZ', selfId: 'late', peers: ['h1', 'g1'] });
 
-    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'in-progress' } });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:closed', id: 'late', reason: 'in-progress', host: ANN } });
     expect(party().status).toBe('error');
     expect(party().error).toBe('match-started'); // what today's screens already explain
+    expect(party().members).toEqual([ANN]); // who's hosting — and, via meta, what they're running
     expect(party().waitingForHost).toBe(true);
     expect(fake.closeCount).toBe(0); // still in the room
 
@@ -603,7 +604,9 @@ describe('useParty — arriving mid-game: the waitlist (host)', () => {
   it('waitlists a latecomer who can wait, and seats them at endMatch — in the next game', () => {
     const { fake, party } = hostMidMatch();
     fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Cy', meta: { avatar: '🐧' }, waitlist: true } });
-    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'late', reason: 'in-progress' });
+    // The turn-away says who is hosting (and their meta — Mojino tags it with the game), so a
+    // latecomer on the wrong game's screen can say so instead of promising "next game".
+    expect(lastSent(fake.sent, 'party:closed')).toMatchObject({ id: 'late', reason: 'in-progress', host: { id: HOST_ID, name: 'Ann', meta: { avatar: '🦊' } } });
     expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1']); // not seated mid-game
     expect(party().waitlist).toEqual([CY]);
 
