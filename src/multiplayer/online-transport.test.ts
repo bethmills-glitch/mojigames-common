@@ -77,7 +77,8 @@ describe('OnlineTransport — host', () => {
     expect(sockets).toHaveLength(1);
     sockets[0].open();
     // The request, then the heartbeat's first ping (see the heartbeat tests below).
-    expect(sockets[0].sent).toEqual([{ type: 'host', size: 4 }, { type: 'ping' }]);
+    // `v: 2` asks the relay for a 6-character code; no `app` was configured, so none is sent.
+    expect(sockets[0].sent).toEqual([{ type: 'host', size: 4, v: 2 }, { type: 'ping' }]);
 
     sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'host' });
     const hosting = eventsOfType(events, 'hosting');
@@ -411,5 +412,65 @@ describe('OnlineTransport — abandoned sockets', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+// ── Relay protocol v2 (2026-10-10): app id, 6-character codes, kick ─────────────────────────
+
+describe('OnlineTransport — protocol v2', () => {
+  it('declares its app (lower-cased) on host and join, so the relay keeps each game apart', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const host = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor, app: ' Mojiventure ' });
+    host.host({ size: 8 });
+    sockets[0].open();
+    expect(sockets[0].sent[0]).toEqual({ type: 'host', size: 8, v: 2, app: 'mojiventure' });
+
+    const guest = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor, app: 'mojiventure' });
+    guest.join('abc def');
+    sockets[1].open();
+    // Inner spaces go as well as outer ones: "ABC DEF" read off a screen is still ABCDEF.
+    expect(sockets[1].sent[0]).toEqual({ type: 'join', code: 'ABCDEF', app: 'mojiventure' });
+  });
+
+  it('sends no app field at all when none is configured (looks like an older build to the relay)', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor, app: '   ' });
+    transport.join('ABCD');
+    sockets[0].open();
+    expect(sockets[0].sent[0]).toEqual({ type: 'join', code: 'ABCD' });
+  });
+
+  it('reports wrong-app, too-many-tries and kicked like any other relay error', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor, app: 'mojino' });
+    const events = collect(transport);
+    transport.join('ABCDEF');
+    sockets[0].open();
+    sockets[0].receive({ type: 'error', reason: 'wrong-app', code: 'ABCDEF' });
+    sockets[0].receive({ type: 'error', reason: 'too-many-tries', code: 'ABCDEF' });
+    sockets[0].receive({ type: 'error', reason: 'kicked', code: 'ABCDEF' });
+    expect(eventsOfType(events, 'error').map((e) => e.reason)).toEqual(['wrong-app', 'too-many-tries', 'kicked']);
+  });
+
+  it('kick() asks the relay to remove a peer', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    transport.host();
+    sockets[0].open();
+    sockets[0].receive({ type: 'hosted', code: 'ABCDEF', peerId: 'h' });
+    transport.kick('guest-1');
+    expect(sockets[0].sent).toContainEqual({ type: 'kick', peerId: 'guest-1' });
+  });
+
+  it('swallows bad-type — what a relay from before v2 answers a kick with — instead of failing the session', () => {
+    const { Ctor, sockets } = fakeWebSocketCtor();
+    const transport = new OnlineTransport({ url: 'ws://test', WebSocketImpl: Ctor });
+    const events = collect(transport);
+    transport.host();
+    sockets[0].open();
+    sockets[0].receive({ type: 'hosted', code: 'ABCD', peerId: 'h' });
+    transport.kick('guest-1');
+    sockets[0].receive({ type: 'error', reason: 'bad-type' });
+    expect(eventsOfType(events, 'error')).toEqual([]);
   });
 });

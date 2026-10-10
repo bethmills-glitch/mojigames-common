@@ -59,6 +59,9 @@ When `status === 'error'`, `error` says why:
 | `host-left` | The host disconnected; this device has hung up too. | no |
 | `connection-lost` | This device lost its connection (including 40 s of silence from the relay). | no |
 | `timeout` | The relay never answered the host/join request (70 s). | no |
+| `wrong-app` | That code is a different game's room (relay protocol v2 — see below). | no |
+| `too-many-tries` | Too many wrong codes from this network; joining is paused ~2 minutes. | no |
+| `kicked` | The host removed this player; this device has hung up. | no |
 
 `waitingForHost` is `true` exactly while the error is one of the two that clear by themselves —
 show "waiting…" with a Cancel (`leave()`) rather than a failure; `status` returns to
@@ -67,7 +70,26 @@ show "waiting…" with a Cancel (`leave()`) rather than a failure; `status` retu
 
 For the host: `waitlist` lists the players waiting for the next game; `endMatch()` seats them,
 and `nextMatch((roster) => payload)` is "Play again" straight from a match that deals them in
-(a second `start()` can't — its payload was built before they were seated).
+(a second `start()` can't — its payload was built before they were seated). `kick(memberId)`
+removes a player (or someone on the waitlist).
+
+Every player name that arrives from another device is cleaned by `useParty` — control and
+invisible/bidi characters removed, at most 24 characters (`cleanPlayerName`,
+`MAX_PLAYER_NAME_LENGTH`). That's a backstop; each game still runs its own name filter.
+
+### Relay protocol v2 — keeping each game's rooms apart (2026-10-10)
+
+Pass your game's id to the transport:
+
+```ts
+new OnlineTransport({ url: RELAY_URL, app: 'mojiventure' }); // or 'cracktheclip', 'mojino'
+```
+
+Every host then gets a 6-character code (old builds still get 4; code boxes must accept 4–6), and
+the relay refuses a join from another game with `wrong-app`. Mojiventure rooms admit only
+Mojiventure clients. The full who-may-join-whom table, the back-compat rules and the **rollout
+order (relay first, then each app's pin + screens, then builds)** are in
+[`relay-server/README.md`](relay-server/README.md#protocol-v2-2026-10-10--kids-safety).
 
 ## Developing
 

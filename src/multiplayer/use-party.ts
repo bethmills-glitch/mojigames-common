@@ -29,6 +29,12 @@
 // Mixed builds share rooms (a friend on last month's app joins yours), so every protocol change
 // here must keep working against the version before it: new fields are optional and ignored by
 // older peers, and nothing new is ever REQUIRED of the other side.
+//
+// Defence in depth (2026-10-10): every player NAME that arrives from another device is cleaned —
+// control/format characters out, at most MAX_PLAYER_NAME_LENGTH characters — before this hook
+// stores or renders it (see cleanPlayerName). Each game still runs its own name filter (the kids'
+// game has a word filter); this only guarantees that a hacked or buggy client can't push a
+// 10,000-character name, a right-to-left override or invisible characters onto everyone's lobby.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -44,6 +50,40 @@ export const DEFAULT_MAX_PLAYERS = 8;
 /** How long a guest waits for the host to answer its `party:hello` before saying so — see
  *  the `joined` handler. The answer is normally back in well under a second. */
 const HOST_REPLY_TIMEOUT_MS = 5_000;
+
+/** The longest player name this hook accepts from the wire — the apps' own name boxes cap at 24,
+ *  so a name typed in any of them passes through unchanged. Counted in characters (code points). */
+export const MAX_PLAYER_NAME_LENGTH = 24;
+
+// Characters a name never needs: C0/C1 controls (newlines, tabs, escapes), line/paragraph
+// separators, and the invisible FORMAT characters — soft hyphen, zero-width space/non-joiner,
+// left-to-right/right-to-left marks, the bidi embeddings/overrides/isolates (U+202A–202E,
+// U+2066–2069: they can make a name display backwards and drag the text after it along), word
+// joiners and the BOM. Spelled out as ranges rather than \p{Cf} so it needs no regex Unicode
+// support from the JS engine. Deliberately KEPT: the zero-width joiner U+200D (it glues emoji like
+// 👩‍👧 together) and the tag characters U+E0020–E007F (the 🏴 England/Scotland/Wales flags).
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g;
+const INVISIBLE_FORMAT_CHARS = /[\u00AD\u061C\u180E\u200B\u200C\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\uFFF9-\uFFFB]/g;
+
+/**
+ * A player name as it may be shown: control characters become spaces, invisible format
+ * characters go, runs of whitespace collapse, and it is cut to MAX_PLAYER_NAME_LENGTH characters
+ * (never through the middle of an emoji's surrogate pair). Empty, or not a string → `fallback`.
+ */
+export function cleanPlayerName(raw: unknown, fallback = 'Player'): string {
+  if (typeof raw !== 'string') return fallback;
+  const tidy = raw.replace(CONTROL_CHARS, ' ').replace(INVISIBLE_FORMAT_CHARS, '').replace(/\s+/g, ' ').trim();
+  const clipped = Array.from(tidy).slice(0, MAX_PLAYER_NAME_LENGTH).join('').trim();
+  return clipped || fallback;
+}
+
+/** A member list from the wire, with every name cleaned (and anything that isn't a member dropped). */
+function cleanMembers<TMeta>(list: unknown): PartyMember<TMeta>[] {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((m): m is PartyMember<TMeta> => !!m && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string')
+    .map((m) => ({ ...m, name: cleanPlayerName(m.name) }));
+}
 
 /**
  * One player in the roster. `meta` is opaque game data (e.g. an avatar) the lobby renders;
@@ -74,7 +114,11 @@ type ProtocolMessage<TStart, TProgress, TMeta> =
   // learns what the room is (Mojino tags meta with its game; a Poker screen that lands in a
   // running Bingo room must say "that code is for Bingo", not "you'll be dealt in next game").
   // Older guests ignore it.
-  | { t: 'party:closed'; id: string; reason: 'in-progress' | 'room-full'; host?: PartyMember<TMeta> };
+  | { t: 'party:closed'; id: string; reason: 'in-progress' | 'room-full'; host?: PartyMember<TMeta> }
+  // Added 2026-10-10: the host removed player `id`. Over the relay the relay itself also drops them
+  // (`Transport.kick`); this message is what reaches a guest on a transport without that (nearby).
+  // Older guests ignore it — over the relay they still get the relay's `kicked` error.
+  | { t: 'party:kicked'; id: string };
 
 export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
   status: MultiplayerStatus;
@@ -97,6 +141,11 @@ export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
    *   'connection-lost'   — this device lost the connection (including 40 s of silence from the
    *                         relay).
    *   'timeout'           — the relay never answered the host/join request.
+   *   'wrong-app'         — that code belongs to a different game's room (relay protocol v2;
+   *                         see OnlineTransport's `app` option).
+   *   'too-many-tries'    — too many wrong codes from this network; joining is paused for a
+   *                         couple of minutes.
+   *   'kicked'            — the host removed this player; this device has hung up.
    *   …plus the nearby transport's own (`no-peers-found`, `permission-denied`, …).
    */
   error: string | null;
@@ -122,6 +171,11 @@ export interface Party<TStart = unknown, TProgress = unknown, TMeta = unknown> {
   join: (code: string) => void;
   /** Leave and tear down the session. */
   leave: () => void;
+
+  /** Host only: remove a player (by member id) from the room — or from the waitlist. They are
+   *  told (their `error` becomes 'kicked') and hang up, and the same connection can't come back.
+   *  No-op for a guest, or for the host's own id. */
+  kick: (memberId: string) => void;
 
   /** Host only: freeze the roster, broadcast `payload`, and enter the match. */
   start: (payload: TStart) => void;
@@ -227,6 +281,9 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
   // seating us clears it, and the error with it. A ref, because the message handler that
   // notices must decide synchronously whether there is an error to clear.
   const waitingRef = useRef<'match-started' | 'host-unresponsive' | null>(null);
+  // Host only: roster ids this host removed with `kick()`, so a hello from one of them later (a
+  // transport that can't bar them itself, e.g. nearby) is answered with another `party:kicked`.
+  const kickedRef = useRef<Set<string>>(new Set());
   const maxPlayers = options.maxPlayers ?? DEFAULT_MAX_PLAYERS;
   const optsRef = useRef(options);
   optsRef.current = options;
@@ -288,6 +345,12 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
       switch (msg.t) {
         case 'party:hello': {
           if (role !== 'host') return;
+          if (typeof msg.id !== 'string') return;
+          if (kickedRef.current.has(msg.id)) {
+            rawSend({ t: 'party:kicked', id: msg.id } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+            return;
+          }
+          const name = cleanPlayerName(msg.name);
           const cur = rosterRef.current;
           if (cur.some((m) => m.id === msg.id)) {
             // A duplicate hello — already seated, so they evidently missed the answer. Say it
@@ -304,30 +367,32 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
             rawSend({ t: 'party:closed', id: msg.id, reason: inProgress ? 'in-progress' : 'room-full', host } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
             // …but a latecomer who can wait goes on the waitlist, to be seated at endMatch().
             if (inProgress && msg.waitlist === true) {
-              benchRef.current.set(from, { id: msg.id, name: msg.name || 'Player', meta: msg.meta });
+              benchRef.current.set(from, { id: msg.id, name, meta: msg.meta });
               setWaitlist([...benchRef.current.values()]);
             }
             return;
           }
           transportIdToRosterId.current.set(from, msg.id);
-          setRoster([...cur, { id: msg.id, name: msg.name || 'Player', meta: msg.meta }]);
+          setRoster([...cur, { id: msg.id, name, meta: msg.meta }]);
           break;
         }
         case 'party:roster':
           if (role === 'guest') {
-            setMembers(msg.members);
-            seatedIn(msg.members);
+            const list = cleanMembers<TMeta>(msg.members);
+            setMembers(list);
+            seatedIn(list);
           }
           break;
         case 'party:start':
           if (role === 'guest') {
+            const list = cleanMembers<TMeta>(msg.members);
             // A match that doesn't list us isn't ours to play: the host turned us away (a game
             // was already running, or the room was full) and this is its NEXT game. Entering it
             // anyway is how a turned-away latecomer ended up watching a game with no cards under
             // a "Connection lost" overlay. Stay put — the waitlist seats us at the next lobby.
-            if (!seatedIn(msg.members)) return;
-            setMatch({ payload: msg.payload, members: msg.members });
-            setMembers(msg.members);
+            if (!seatedIn(list)) return;
+            setMatch({ payload: msg.payload, members: list });
+            setMembers(list);
             setPhase('match');
           }
           break;
@@ -336,7 +401,8 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
           // it — the room, the share code and this socket all stay exactly as they are, which is
           // the whole point: nobody re-enters a code between games.
           if (role === 'guest') {
-            setMembers(msg.members);
+            const list = cleanMembers<TMeta>(msg.members);
+            setMembers(list);
             setMatch(null);
             setPhase('lobby');
             setProgress({});
@@ -344,7 +410,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
             // this version would have seated us (we'd be in `members`); an older one doesn't
             // keep a waitlist — but the room is open again, so ask again: in the lobby it seats a
             // hello like any other.
-            if (!seatedIn(msg.members) && waitingRef.current === 'match-started' && helloRef.current) {
+            if (!seatedIn(list) && waitingRef.current === 'match-started' && helloRef.current) {
               rawSend(helloRef.current);
             }
           }
@@ -372,10 +438,22 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
               // `waitingForHost` lets a newer screen say "you're in the next game".
               waitingRef.current = 'match-started';
               // Show who's hosting (and what they're running — see `party:closed`) while we wait.
-              if (msg.host && typeof msg.host === 'object' && msg.host.id === HOST_ID) setMembers([msg.host]);
+              if (msg.host && typeof msg.host === 'object' && msg.host.id === HOST_ID) setMembers(cleanMembers<TMeta>([msg.host]));
               setError('match-started');
               setStatus('error');
             }
+          }
+          break;
+        case 'party:kicked':
+          // The host removed THIS device. Hang up — over the relay it has dropped us already;
+          // over nearby this is the only notice. Everyone else ignores it (they'll see the usual
+          // roster change).
+          if (role === 'guest' && msg.id === selfIdRef.current) {
+            clearHelloTimer();
+            waitingRef.current = null;
+            setError('kicked');
+            setStatus('error');
+            dropTransport();
           }
           break;
         case 'party:progress':
@@ -395,9 +473,10 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
           setCode(event.code);
           setSelfId(HOST_ID);
           selfIdRef.current = HOST_ID;
-          const seed: PartyMember<TMeta> = { id: HOST_ID, name: optsRef.current.self.name, meta: optsRef.current.self.meta };
+          const seed: PartyMember<TMeta> = { id: HOST_ID, name: cleanPlayerName(optsRef.current.self.name), meta: optsRef.current.self.meta };
           rosterRef.current = [seed];
           benchRef.current.clear();
+          kickedRef.current.clear();
           setWaitlist([]);
           setMembers([seed]);
           setStatus('waiting');
@@ -482,6 +561,9 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
           waitingRef.current = null;
           setError(event.reason);
           setStatus('error');
+          // Removed by the host (the relay's own notice): hang up, rather than sit on a socket
+          // that is in no room. (A `party:kicked` may have got here first and hung up already.)
+          if (event.reason === 'kicked') dropTransport();
           break;
         case 'closed':
           clearHelloTimer();
@@ -521,6 +603,32 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
       ensureTransport().join(joinCode);
     },
     [ensureTransport],
+  );
+
+  // Host: remove a player. Three layers, so it works on every transport and against every build:
+  //   1. `party:kicked` — a guest on this version hangs up by itself (the only notice over nearby);
+  //   2. `Transport.kick` — the relay drops the connection from the room and bars it from coming
+  //      back (an older guest is told by the relay's `kicked` error);
+  //   3. the roster/waitlist here, at once — the relay's `peer-leave` then finds nothing to do.
+  const kick = useCallback(
+    (memberId: string) => {
+      if (roleRef.current !== 'host' || !memberId || memberId === HOST_ID) return;
+      // The transport-level id this member is reached by (on nearby it differs from the roster id).
+      let transportId: string = memberId;
+      for (const [tid, rid] of transportIdToRosterId.current) if (rid === memberId) transportId = tid;
+      for (const [tid, m] of benchRef.current) if (m.id === memberId) transportId = tid;
+      kickedRef.current.add(memberId);
+      rawSend({ t: 'party:kicked', id: memberId } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+      transportRef.current?.kick?.(transportId);
+      if (benchRef.current.delete(transportId)) setWaitlist([...benchRef.current.values()]);
+      transportIdToRosterId.current.delete(transportId);
+      if (rosterRef.current.some((m) => m.id === memberId)) {
+        setRoster(rosterRef.current.filter((m) => m.id !== memberId));
+        rawSend({ t: 'party:leave', id: memberId } satisfies ProtocolMessage<TStart, TProgress, TMeta>);
+        setProgress((cur) => dropKey(cur, memberId));
+      }
+    },
+    [rawSend, setRoster],
   );
 
   const start = useCallback(
@@ -614,6 +722,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
     waitingRef.current = null;
     helloRef.current = null;
     benchRef.current.clear();
+    kickedRef.current.clear();
     transportIdToRosterId.current.clear();
     setStatus('closed');
     setPhase('lobby');
@@ -638,7 +747,7 @@ export function useParty<TStart = unknown, TProgress = unknown, TMeta = unknown>
 
   const waitingForHost = status === 'error' && (error === 'match-started' || error === 'host-unresponsive');
 
-  return { status, code, error, waitingForHost, isHost, selfId, members, waitlist, phase, host, join, leave, start, match, endMatch, nextMatch, reportProgress, progress, broadcast };
+  return { status, code, error, waitingForHost, isHost, selfId, members, waitlist, phase, host, join, leave, kick, start, match, endMatch, nextMatch, reportProgress, progress, broadcast };
 }
 
 /** Return a copy of `obj` without `key` — used to drop a departed player's progress. */

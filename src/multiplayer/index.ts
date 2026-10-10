@@ -16,7 +16,7 @@ export type {
   TransportListener,
 } from './types';
 
-export { OnlineTransport } from './online-transport';
+export { OnlineTransport, RELAY_PROTOCOL_VERSION } from './online-transport';
 export type {
   OnlineTransportOptions,
   WebSocketCtor,
@@ -26,5 +26,5 @@ export type {
 export { useMultiplayer } from './use-multiplayer';
 export type { Multiplayer, MultiplayerStatus } from './use-multiplayer';
 
-export { useParty, HOST_ID, DEFAULT_MAX_PLAYERS } from './use-party';
+export { useParty, HOST_ID, DEFAULT_MAX_PLAYERS, MAX_PLAYER_NAME_LENGTH, cleanPlayerName } from './use-party';
 export type { Party, PartyMember, PartyPhase, UsePartyOptions } from './use-party';

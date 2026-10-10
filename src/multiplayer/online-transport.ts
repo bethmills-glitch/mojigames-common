@@ -13,6 +13,14 @@
 // the heartbeat notes in relay-server/server.js. The pings let the relay notice when THIS
 // device stops (a sleeping phone, a backgrounded app) and tell the rest of the room; the
 // silence check lets this device notice a link that died without ever reporting a close.
+//
+// ── Protocol v2 (2026-10-10) ──
+// Every host request says `v: 2`, so the relay mints a 6-character code (4 is guessable). With the
+// `app` option set, host and join requests also say which game this is, and the relay refuses a
+// join into another game's room (`wrong-app`) — so an adult mistyping a code can't land in a kids'
+// room. `kick(peerId)` lets a host remove a player. All of it is ignored by a relay from before v2
+// (the extra fields) or answered with `bad-type` (kick) — which this transport swallows — so a new
+// build still works against an old relay; see relay-server/README.md for the rollout order.
 
 import type { Transport, TransportEvent, TransportListener } from './types';
 
@@ -34,6 +42,13 @@ export type WebSocketCtor = new (url: string) => WebSocketLike;
 export interface OnlineTransportOptions {
   /** Relay server URL — `ws://localhost:8787` in dev, `wss://…` once deployed. */
   url: string;
+  /**
+   * Which game this is — e.g. `'cracktheclip'`, `'mojino'`, `'mojiventure'` (lower-case letters,
+   * digits and dashes). Sent with every host and join so the relay can keep each game's rooms
+   * apart: a join into another game's room fails with `wrong-app`. Mojiventure rooms admit ONLY
+   * Mojiventure clients; leaving it out keeps the pre-2026-10-10 behaviour (see the relay README).
+   */
+  app?: string;
   /** WebSocket implementation. Defaults to the global one (present in RN and browsers). */
   WebSocketImpl?: WebSocketCtor;
   /** Override the host/join response timeout — exposed for tests. */
@@ -47,6 +62,9 @@ export interface OnlineTransportOptions {
 
 /** The OPEN ready-state value — identical (`1`) across every WebSocket implementation. */
 const WS_OPEN = 1;
+
+/** The relay protocol version this client speaks — sent with `host` (see the header note). */
+export const RELAY_PROTOCOL_VERSION = 2;
 
 /** Heartbeat ping cadence. The relay drops a pinging client after 150 s of silence (a phone that
  *  slept or an app left in the background that long), so a live client can lose several pings in a
@@ -81,6 +99,7 @@ interface RelayMessage {
 
 export class OnlineTransport implements Transport {
   private readonly url: string;
+  private readonly app: string | undefined;
   private readonly WebSocketImpl: WebSocketCtor;
   private readonly connectTimeoutMs: number;
   private readonly pingIntervalMs: number;
@@ -112,6 +131,8 @@ export class OnlineTransport implements Transport {
 
   constructor(options: OnlineTransportOptions) {
     this.url = options.url;
+    const app = options.app?.trim().toLowerCase();
+    this.app = app ? app : undefined;
     const Impl =
       options.WebSocketImpl ??
       (globalThis as { WebSocket?: WebSocketCtor }).WebSocket;
@@ -138,13 +159,20 @@ export class OnlineTransport implements Transport {
   }
 
   join(code: string): void {
-    this.pendingIntent = { kind: 'join', code: code.toUpperCase().trim() };
+    // Inner spaces go too: a code read off a screen as "ABC DEF" is still ABCDEF.
+    this.pendingIntent = { kind: 'join', code: code.toUpperCase().replace(/\s+/g, '') };
     this.startConnectTimeout();
     this.beginOrResend();
   }
 
   send(data: unknown): void {
     this.sendRaw({ type: 'msg', data });
+  }
+
+  /** Host only: remove `peerId` from the room. The relay tells them (`error: kicked`), the room
+   *  gets an ordinary `peer-leave`, and that connection can't re-join. Ignored from a guest. */
+  kick(peerId: string): void {
+    this.sendRaw({ type: 'kick', peerId });
   }
 
   close(): void {
@@ -188,10 +216,13 @@ export class OnlineTransport implements Transport {
   /** Send the pending host/join request over the (open) socket. */
   private sendIntent(): void {
     const intent = this.pendingIntent;
+    // `app` is only sent when set, so a game that hasn't adopted it yet looks exactly like an
+    // older build to the relay (and gets the same transition rules).
+    const app = this.app ? { app: this.app } : {};
     if (intent?.kind === 'host') {
-      this.sendRaw({ type: 'host', size: intent.size });
+      this.sendRaw({ type: 'host', size: intent.size, v: RELAY_PROTOCOL_VERSION, ...app });
     } else if (intent?.kind === 'join') {
-      this.sendRaw({ type: 'join', code: intent.code });
+      this.sendRaw({ type: 'join', code: intent.code, ...app });
     }
   }
 
@@ -369,6 +400,10 @@ export class OnlineTransport implements Transport {
         this.emit({ type: 'message', from: msg.from ?? '', data: msg.data });
         break;
       case 'error':
+        // `bad-type` only ever means "this relay doesn't know that message" — a kick sent to a
+        // relay from before protocol v2. Nothing is wrong with the session, so don't report it:
+        // every screen turns an error into a failure.
+        if (msg.reason === 'bad-type') break;
         this.clearConnectTimeout();
         this.emit({ type: 'error', reason: msg.reason ?? 'unknown' });
         break;

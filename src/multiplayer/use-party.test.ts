@@ -6,7 +6,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 
 import type { Transport, TransportEvent, TransportListener } from './types';
-import { HOST_ID, useParty, type Party } from './use-party';
+import { cleanPlayerName, HOST_ID, MAX_PLAYER_NAME_LENGTH, useParty, type Party } from './use-party';
 
 // ── A fake Transport: records sends, lets the test fire inbound events ─────────────────────
 function createFakeTransport() {
@@ -15,7 +15,11 @@ function createFakeTransport() {
   let hostSize: number | undefined;
   let joinedCode: string | undefined;
   let closeCount = 0;
+  const kicked: string[] = [];
   const transport: Transport = {
+    kick: (peerId) => {
+      kicked.push(peerId);
+    },
     host: (o) => {
       hostSize = o?.size;
     },
@@ -45,6 +49,8 @@ function createFakeTransport() {
     get joinedCode() {
       return joinedCode;
     },
+    /** Peer ids the hook asked the transport to remove (Transport.kick). */
+    kicked,
     /** How many times the hook hung up this transport. */
     get closeCount() {
       return closeCount;
@@ -821,5 +827,184 @@ describe('useParty — host and guests together', () => {
     act(() => cy().join('ROOM'));
     expect(cy().status).toBe('error');
     expect(cy().error).toBe('no-room');
+  });
+});
+
+// ── Player names from the wire are cleaned (2026-10-10, defence in depth) ─────────────────────
+
+describe('cleanPlayerName', () => {
+  it('leaves an ordinary name — emoji included — exactly as typed', () => {
+    expect(cleanPlayerName('Ann')).toBe('Ann');
+    expect(cleanPlayerName('Zoë 🦊')).toBe('Zoë 🦊');
+    expect(cleanPlayerName('👩‍👧 Mum')).toBe('👩‍👧 Mum'); // the zero-width joiner survives
+    expect(cleanPlayerName('🏴󠁧󠁢󠁳󠁣󠁴󠁿 Ali')).toBe('🏴󠁧󠁢󠁳󠁣󠁴󠁿 Ali'); // so do the flag's tag characters
+  });
+
+  it('turns control characters into spaces and drops invisible/bidi ones', () => {
+    expect(cleanPlayerName('Bo\nby\t\u0007!')).toBe('Bo by !');
+    expect(cleanPlayerName('‮evil‬')).toBe('evil');
+    expect(cleanPlayerName('a​b﻿c⁦d⁩')).toBe('abcd');
+  });
+
+  it(`cuts a name to ${MAX_PLAYER_NAME_LENGTH} characters, never through an emoji`, () => {
+    expect(cleanPlayerName('x'.repeat(10_000))).toBe('x'.repeat(MAX_PLAYER_NAME_LENGTH));
+    const emojis = cleanPlayerName('🦊'.repeat(30));
+    expect(Array.from(emojis)).toHaveLength(MAX_PLAYER_NAME_LENGTH);
+    expect(emojis).toBe('🦊'.repeat(MAX_PLAYER_NAME_LENGTH));
+  });
+
+  it('falls back to "Player" for nothing, blanks, or a non-string', () => {
+    expect(cleanPlayerName('')).toBe('Player');
+    expect(cleanPlayerName(' ​\n ')).toBe('Player');
+    expect(cleanPlayerName(undefined)).toBe('Player');
+    expect(cleanPlayerName({ evil: true })).toBe('Player');
+  });
+});
+
+describe('useParty — names from other devices are cleaned', () => {
+  it('host: a guest hello with a hostile name is seated under a clean one', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } });
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZAB', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: '‮' + 'B'.repeat(500) + '\n', meta: { avatar: '🐼' } } });
+    expect(party().members[1]).toEqual({ id: 'g1', name: 'B'.repeat(MAX_PLAYER_NAME_LENGTH), meta: { avatar: '🐼' } });
+    expect(lastSent(fake.sent, 'party:roster')).toMatchObject({ members: [{ id: HOST_ID }, { id: 'g1', name: 'B'.repeat(MAX_PLAYER_NAME_LENGTH) }] });
+  });
+
+  it('guest: names in the roster, start and lobby messages are cleaned too', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZAB'));
+    fake.fire({ type: 'joined', code: 'WXYZAB', selfId: 'g1', peers: ['h1'] });
+    const roster = [
+      { id: HOST_ID, name: 'Ann\u0000‮', meta: { avatar: '🦊' } },
+      { id: 'g1', name: 'Bo', meta: { avatar: '🐼' } },
+      'not a member',
+    ];
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: roster } });
+    expect(party().members.map((m) => m.name)).toEqual(['Ann', 'Bo']);
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:start', payload: { items: [1] }, members: roster } });
+    expect(party().match?.members.map((m) => m.name)).toEqual(['Ann', 'Bo']);
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:lobby', members: [{ id: HOST_ID, name: 'x'.repeat(99), meta: {} }, { id: 'g1', name: 'Bo', meta: {} }] } });
+    expect(party().members[0].name).toBe('x'.repeat(MAX_PLAYER_NAME_LENGTH));
+  });
+});
+
+// ── Kick (2026-10-10) ─────────────────────────────────────────────────────────────────────────
+
+describe('useParty — the host removes a player', () => {
+  function hostWithGuests() {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } });
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZAB', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    fake.fire({ type: 'message', from: 'g2', data: { t: 'party:hello', id: 'g2', name: 'Cy', meta: { avatar: '🐧' } } });
+    return { fake, party };
+  }
+
+  it('drops them from the roster, tells everyone, and asks the transport to remove them', () => {
+    const { fake, party } = hostWithGuests();
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:progress', id: 'g1', progress: { score: 9 } } });
+    act(() => party().kick('g1'));
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g2']);
+    expect(party().progress).toEqual({});
+    expect(fake.kicked).toEqual(['g1']);
+    expect(lastSent(fake.sent, 'party:kicked')).toEqual({ t: 'party:kicked', id: 'g1' });
+    expect(lastSent(fake.sent, 'party:leave')).toEqual({ t: 'party:leave', id: 'g1' });
+    expect(lastSent(fake.sent, 'party:roster')).toMatchObject({ members: [{ id: HOST_ID }, { id: 'g2' }] });
+    // The relay's peer-leave for them, arriving afterwards, changes nothing.
+    fake.fire({ type: 'peer-leave', peerId: 'g1' });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g2']);
+  });
+
+  it('a removed player who says hello again (a transport that cannot bar them) is turned away again', () => {
+    const { fake, party } = hostWithGuests();
+    act(() => party().kick('g1'));
+    fake.sent.length = 0;
+    fake.fire({ type: 'message', from: 'g1', data: { t: 'party:hello', id: 'g1', name: 'Bo', meta: { avatar: '🐼' } } });
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g2']);
+    expect(lastSent(fake.sent, 'party:kicked')).toEqual({ t: 'party:kicked', id: 'g1' });
+  });
+
+  it('reaches a nearby guest by its TRANSPORT id when that differs from its roster id', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Ann', meta: { avatar: '🦊' } });
+    act(() => party().host());
+    fake.fire({ type: 'hosting', code: 'WXYZAB', selfId: 'h1' });
+    fake.fire({ type: 'message', from: 'endpoint-7', data: { t: 'party:hello', id: 'guest-self', name: 'Bo', meta: { avatar: '🐼' } } });
+    act(() => party().kick('guest-self'));
+    expect(fake.kicked).toEqual(['endpoint-7']);
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID]);
+  });
+
+  it('can remove someone from the waitlist', () => {
+    const { fake, party } = hostWithGuests();
+    act(() => party().start({ items: [1] }));
+    fake.fire({ type: 'message', from: 'late', data: { t: 'party:hello', id: 'late', name: 'Di', meta: { avatar: '🐨' }, waitlist: true } });
+    expect(party().waitlist.map((m) => m.id)).toEqual(['late']);
+    act(() => party().kick('late'));
+    expect(party().waitlist).toEqual([]);
+    expect(fake.kicked).toEqual(['late']);
+    act(() => party().endMatch());
+    expect(party().members.map((m) => m.id)).toEqual([HOST_ID, 'g1', 'g2']);
+  });
+
+  it('is a no-op from a guest, and for the host itself', () => {
+    const { fake, party } = hostWithGuests();
+    act(() => party().kick(HOST_ID));
+    expect(fake.kicked).toEqual([]);
+    expect(party().members).toHaveLength(3);
+
+    const guestFake = createFakeTransport();
+    const guest = renderParty(guestFake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => guest().join('WXYZAB'));
+    guestFake.fire({ type: 'joined', code: 'WXYZAB', selfId: 'g1', peers: ['h1'] });
+    act(() => guest().kick('h1'));
+    expect(guestFake.kicked).toEqual([]);
+    expect(lastSent(guestFake.sent, 'party:kicked')).toBeUndefined();
+  });
+});
+
+describe('useParty — being removed (guest)', () => {
+  function joinedGuest() {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZAB'));
+    fake.fire({ type: 'joined', code: 'WXYZAB', selfId: 'g1', peers: ['h1'] });
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:roster', members: [{ id: HOST_ID, name: 'Ann', meta: {} }, { id: 'g1', name: 'Bo', meta: {} }] } });
+    return { fake, party };
+  }
+
+  it('party:kicked for this device → error "kicked" and it hangs up', () => {
+    const { fake, party } = joinedGuest();
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:kicked', id: 'g1' } });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('kicked');
+    expect(fake.closeCount).toBe(1);
+  });
+
+  it('ignores a party:kicked aimed at someone else', () => {
+    const { fake, party } = joinedGuest();
+    fake.fire({ type: 'message', from: 'h1', data: { t: 'party:kicked', id: 'g2' } });
+    expect(party().status).toBe('connected');
+    expect(fake.closeCount).toBe(0);
+  });
+
+  it("the relay's own kicked error does the same (an older host, or the relay got there first)", () => {
+    const { fake, party } = joinedGuest();
+    fake.fire({ type: 'error', reason: 'kicked' });
+    expect(party().error).toBe('kicked');
+    expect(fake.closeCount).toBe(1);
+  });
+
+  it('wrong-app is reported as an ordinary error', () => {
+    const fake = createFakeTransport();
+    const party = renderParty(fake, { name: 'Bo', meta: { avatar: '🐼' } });
+    act(() => party().join('WXYZAB'));
+    fake.fire({ type: 'error', reason: 'wrong-app' });
+    expect(party().status).toBe('error');
+    expect(party().error).toBe('wrong-app');
   });
 });

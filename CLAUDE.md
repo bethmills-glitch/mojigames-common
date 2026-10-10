@@ -92,6 +92,14 @@ cloned via a `MOJIGAMES_COMMON_TOKEN` secret + an `eas-build-pre-install` hook o
   branch on transport type inside the hook.
 - **Relay protocol is a contract.** `server.js`, the `OnlineTransport` client, and
   `smoke-test.js` must stay in sync. Run the smoke test after touching the wire format.
+- **Protocol v2 (2026-10-10, kids' safety)** — all optional fields: `host.v: 2` → 6-char codes
+  (legacy hosts keep 4; joins take both); `app` on host/join keeps each game's rooms apart
+  (`wrong-app`), with Mojiventure STRICT (never mixes with an app-less client, either way) and
+  Crack the Clip / Mojino lenient toward app-less legacy clients during the transition; rate
+  limits keyed on the X-Forwarded-For client (`XFF_TRUSTED_HOPS`), plus a per-address wrong-code
+  pause (`too-many-tries`); host `kick`. `useParty` cleans incoming player names. The full
+  matrix + rollout order (relay FIRST, then app pins, then builds) is in relay-server/README.md.
+  Apps opt in with `new OnlineTransport({ url, app: '<id>' })`.
 - **Old clients must keep working, forever.** Shipped app builds pin an older commit of this
   library but talk to the ONE live relay (it redeploys when `main` is pushed), and mixed
   builds share rooms. So the relay may only apply a new rule to clients that opt in (the

@@ -27,7 +27,10 @@ export type TransportEvent =
   | { type: 'peer-leave'; peerId: PeerId }
   /** A message relayed from peer `from` — `data` is the game's own opaque payload. */
   | { type: 'message'; from: PeerId; data: unknown }
-  /** Something went wrong — see `reason` (`no-room`, `room-full`, `connection-lost`, …). */
+  /** Something went wrong — see `reason` (`no-room`, `room-full`, `connection-lost`, and from
+   *  the relay's protocol v2: `wrong-app` (that code is another game's room), `too-many-tries`
+   *  (too many wrong codes from this network — wait a couple of minutes), `kicked` (the host
+   *  removed this player), …). */
   | { type: 'error'; reason: string }
   /** The transport has fully shut down; no further events will be emitted. */
   | { type: 'closed' };
@@ -50,6 +53,10 @@ export interface Transport {
   join(code: string): void;
   /** Send `data` to every other peer in the room. A no-op before the room is established. */
   send(data: unknown): void;
+  /** Host only, OPTIONAL: remove a peer from the room at the transport level (the relay drops
+   *  them and they can't re-join on the same connection). `OnlineTransport` implements it; a
+   *  transport without it relies on useParty's own `party:kicked` message. */
+  kick?(peerId: PeerId): void;
   /** Leave the room and tear down the connection. Emits `closed`. */
   close(): void;
   /** Subscribe to transport events. Returns an unsubscribe function. */
