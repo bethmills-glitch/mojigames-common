@@ -1,8 +1,9 @@
 # Render Blueprint — deploys the shared Mojigames online-multiplayer relay server.
 #
 # This relay is game-agnostic: one deployment backs online play for every Mojigames title
-# (Mojino, Mojiventure, HitMoji). Rooms are keyed by share code only, with no game-type field,
-# so all three apps can safely point at the same instance at once.
+# (Mojino, Mojiventure, Crack the Clip / HitMoji). Since protocol v2 (2026-10-10) a room also
+# remembers which game created it, and the relay refuses a join from a different game
+# (`wrong-app`) — Mojiventure (kids) rooms are strict. See relay-server/README.md.
 #
 # How to use (one time):
 #   1. Push this repo to GitHub (it already is: bethmills-glitch/mojigames-common).
@@ -14,7 +15,9 @@
 #      app's src/multiplayer/config.ts).
 #
 # Note: the free plan sleeps after ~15 min idle, so the very first host of a session may
-# wait ~30-60s while it wakes. Upgrade the plan to keep it always-on.
+# wait ~50 s while it wakes. Upgrading (Render "Starter", ~$7/month) keeps it always-on — see
+# "Hosting plan" in relay-server/README.md. Changing `plan:` below is a BILLING change: only with
+# Beth's go-ahead.
 services:
   - type: web
     name: mojigames-relay
